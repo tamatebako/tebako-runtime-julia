@@ -512,15 +512,18 @@ template instances (php = source-build, julia = repack).
   ships tar.gz** (verify: zero symlinks inside): Git-bash's GNU tar
   suffices, and the runner's hosted ruby + Git-bash run the stdlib-only
   tooling (the openjdk factory's msys2 need was bsdtar-for-zip + the
-  gcc runtime — re-derive your own need, never inherit it). Two
-  windows-specific tool notes ride the smoke/gate: the exec cache keys
-  under the windows temp vars (`std::env::temp_dir` reads TMP/TEMP,
-  never TMPDIR — pin all three), and native tool invocations from
+  gcc runtime — re-derive your own need, never inherit it). Three
+  windows-specific tool notes ride the smoke/gate/tooling: the exec
+  cache keys under the windows temp vars (`std::env::temp_dir` reads
+  TMP/TEMP, never TMPDIR — pin all three); native tool invocations from
   Git-bash want `MSYS2_ARG_CONV_EXCL='*'` for VFS-path arguments plus
-  `cygpath -m` for host paths (the openjdk idiom). The `--tebako-image`
-  triple survives windows drive letters by construction (the driver
-  splits on the last two colons — its own `windows_drive_colon_survives`
-  test).
+  `cygpath -m` for host paths (the openjdk idiom); and Git-bash's GNU
+  tar parses a drive-letter colon in the `-f` archive path as an rsh
+  host:path pair ("Cannot connect to D: resolve failed") — pass
+  `--force-local` on windows extract invocations (bsdtar rejects the
+  flag, so gate it on the platform). The `--tebako-image` triple
+  survives windows drive letters by construction (the driver splits on
+  the last two colons — its own `windows_drive_colon_survives` test).
 
 ## 4. The opening checklist
 
