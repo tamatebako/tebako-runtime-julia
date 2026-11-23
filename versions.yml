@@ -45,3 +45,12 @@ versions:
       x86_64-linux-gnu:
         url: https://julialang-s3.julialang.org/bin/linux/x64/1.13/julia-1.13.4-linux-x86_64.tar.gz
         sha256: cf1658f13b91facccd57d41464d7125a0e48a1d24f49062d71532d04d4ec4130
+      x86_64-macos:
+        url: https://julialang-s3.julialang.org/bin/mac/x64/1.13/julia-1.13.4-mac64.tar.gz
+        sha256: c84de0fcb4268841f296fd56c47c27383d81358033428389b0d1882b110b9bcd
+      aarch64-macos:
+        url: https://julialang-s3.julialang.org/bin/mac/aarch64/1.13/julia-1.13.4-macaarch64.tar.gz
+        sha256: 8e58a1993ecbadb9a762a987eefa4e484b364a8560349609cc05e93287b9a8fe
+      x86_64-windows-ucrt:
+        url: https://julialang-s3.julialang.org/bin/winnt/x64/1.13/julia-1.13.4-win64.tar.gz
+        sha256: 0040faa2b4599745dcd129bb1b99e607082240dd1df18149eee02a74490f5188

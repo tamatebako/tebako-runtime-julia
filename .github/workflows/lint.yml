@@ -27,8 +27,8 @@
 # contract.yml against its schema + the driver-source parity arm, the
 # version catalog resolvable, the leg matrix computable, every authored
 # YAML/JSON parseable, every authored ruby file ruby -c clean. The build
-# leg's own gates (provenance, boot smoke) live in build-linux-gnu.yml.
-# (tebako-runtime-php's lint.yml port.)
+# legs' own gates (provenance, boot smoke) live in the build-<platform>.yml
+# triggers. (tebako-runtime-php's lint.yml port.)
 name: lint
 
 on:

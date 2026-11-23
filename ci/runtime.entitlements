@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Spec 31 §3/§5: the macOS runtime signing profile (fixed pair, pinned
+  here until spec 31 §2's manifest derivation lands). This factory signs
+  only the LAUNCHER exe — the interpreter inside the env image keeps
+  upstream's own Developer ID signature byte-identical (the repack arm
+  never re-signs upstream bytes; upstream julia ships hardened-runtime
+  with its own allow-jit / disable-library-validation /
+  allow-dyld-environment-variables grants, which are what govern the
+  materialized interpreter process post-exec).
+
+  disable-library-validation — EVERY runtime slice: a hardened-runtime
+    process by default refuses unsigned dylibs, and the driver's boot
+    arms DYLD_INSERT_LIBRARIES with the in-image preload shim (spec 22
+    tier 1 — the unpatched julia interpreter's only VFS visibility); the
+    shim carries no Developer ID signature of its own (§1.4). The same
+    grant covers the driver materializing in-image dylibs (julia's
+    lib/julia closure) to the host for dlopen.
+  allow-jit — julia's LLVM JIT maps executable memory at runtime as a
+    matter of course (the JIT is julia's execution model, not an
+    opt-in): the grant is load-bearing the moment the interpreter's own
+    signature does not govern (and inert where it does) — a grant,
+    never a requirement.
+
+  Keep the two <true/> values on their own lines: the embedding check
+  in ci/macos-sign-notarize-runtime.sh counts them (macOS 15 emits the
+  embedded plist single-line, so it greps for <true/>, not key names).
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+</dict>
+</plist>

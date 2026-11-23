@@ -40,13 +40,15 @@ module TebakoJuliaBuilder
   # never a silent surprise in the image.
   class TreeStager
     INTERPRETER_PATH = File.join("bin", "julia").freeze
+    INTERPRETER_PATH_WINDOWS = File.join("bin", "julia.exe").freeze
 
-    def initialize(prefix:, tarball:, src_sha256:, julia_version:, triplet:)
+    def initialize(prefix:, tarball:, src_sha256:, julia_version:, triplet:, platform:)
       @prefix = prefix
       @tarball = tarball
       @src_sha256 = src_sha256
       @julia_version = julia_version
       @triplet = triplet
+      @platform = platform
     end
 
     # Extract the tarball into a fresh tree; returns the staged tree's
@@ -77,11 +79,12 @@ module TebakoJuliaBuilder
     private
 
     def assert_interpreter!(tree)
-      return if File.file?(File.join(tree, INTERPRETER_PATH))
+      interpreter = @platform.msys? ? INTERPRETER_PATH_WINDOWS : INTERPRETER_PATH
+      return if File.file?(File.join(tree, interpreter))
 
       raise TebakoJuliaBuilder::Error.new(
-        "the staged julia tree carries no #{INTERPRETER_PATH} — the upstream archive's layout " \
-        "drifted from the layout.interpreter declaration (/bin/julia)", 131
+        "the staged julia tree carries no #{interpreter} — the upstream archive's layout " \
+        "drifted from the layout.interpreter declaration (#{interpreter.insert(0, '/')})", 131
       )
     end
 

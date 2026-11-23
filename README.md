@@ -19,18 +19,31 @@ compatible with.
 julialang.org archive → stage/prune the tree → fetch/verify the pinned
 product assets (launcher, link unit, tfs CLI) → env-image pack →
 packaging → provenance gate → boot smoke — is implemented in
-`build/lib/tebako_julia_builder/` and wired into one platform workflow
-(`build-linux-gnu.yml`, a thin trigger over `_build-platform.yml`:
-parity → compute → preflight → build → verify), covering **linux-gnu
-x86_64** in the digest-pinned tpkg-builder container. The boot smoke
-carries the compute-floor scenario (fib(35), `@elapsed` best-of-three,
-fail-closed — tebako-runtime-python#79's lesson class). **No release
-has been cut**: every increment stays draft-PR-only until the whole
-chain is green end-to-end (the owner's rule). What is missing, each its
-own increment: the publish pipeline + the first real release, the
-windows and macos legs, the linux-musl + arm64 triplets, the julialang
-release monitor, the boot-contract parity `spec/` suite, and the
-hello-runtimes acceptance arm.
+`build/lib/tebako_julia_builder/` and wired into three platform
+workflows (`build-linux-gnu.yml`, `build-macos.yml`,
+`build-windows.yml` — thin triggers over `_build-platform.yml`: parity
+→ compute → preflight → build → publish → verify), covering
+**linux-gnu x86_64** (digest-pinned tpkg-builder container), **macos
+arm64 + x86_64** (runner-native, with the spec 31 sign+notarize arm
+gated on `APPLE_SIGNING_ENABLED`), and **windows x64** (Git-bash + the
+runner's hosted ruby — the repack arm needs no toolchain there). The
+boot smoke carries the compute-floor scenario (fib(35), `@elapsed`
+best-of-three, fail-closed — tebako-runtime-python#79's lesson class).
+The publish pipeline is present — `publish.yml` (the php factory's
+coordinator port: per-leg publish+sign via the tebako-release gem,
+SLSA attest, `.manifest.json` shards, registry render) — but **never
+fired**: no release has been cut, and every increment stays
+draft-PR-only until the whole chain is green end-to-end (the owner's
+rule). What is missing, each its own increment: the first real release
+(the owner fires the coordinator), the linux-gnu arm64 triplet
+(upstream ships the aarch64 linux archive — a matrix row + a
+`versions.yml` sources entry in one PR), the julialang release monitor,
+the boot-contract parity `spec/` suite, and the hello-runtimes
+acceptance arm. linux-musl and windows arm64 have **no upstream
+binaries** (julialang.org publishes no musl julia ≥ 1.11 and no
+windows aarch64 — checked against `versions.json` 2026-11-23; a musl
+leg means a tamatebako source factory, not a repack row), and windows
+Authenticode signing is the spec 34 increment.
 
 ## Why a tebako julia runtime (the honest framing)
 
@@ -88,11 +101,24 @@ Rationale:
   merged env+app images). The env image is always the standalone `.tfs`
   the wrapper mounts whole at the runtime root.
 
-The provenance gate proves the consumption did not drift: the shipped
-exe's sha256 must equal the release-published launcher digest recorded
-in the pair's `.contract.yaml` (`link_unit.launcher_sha256`), and the
+The provenance gate proves the consumption did not drift. On linux and
+windows the shipped exe's sha256 must equal the release-published
+launcher digest recorded in the pair's `.contract.yaml`
+(`link_unit.launcher_sha256`) — the byte anchor — and on linux the
 exe's runtime library closure must be system-only (the audience rule —
-a bare target system satisfies it).
+a bare target system satisfies it). macOS is the deliberate exception:
+the exe is **signed and notarized in-leg** (spec 31 —
+`ci/macos-sign-notarize-runtime.sh`, Developer ID Application +
+hardened runtime + the `ci/runtime.entitlements` pair, gated on the
+`APPLE_SIGNING_ENABLED` repo variable), so its shipped bytes are not
+the release's bytes; the gate's Mach-O arm anchors the exe `.sha256`
+sidecar to the SIGNED bytes (the sign step rewrites it — sign-then-hash),
+verifies the signature strict, and, when armed, asserts the team
+identity, the embedded entitlement pair, and the notarization ticket.
+The card keeps recording the fetch-verified release digest as
+consumption provenance. (windows Authenticode signing is the spec 34
+increment — the windows exe ships the release's bytes byte-identical,
+and the byte anchor holds there.)
 
 ## The interpreter home: exec-cache visibility
 
@@ -114,11 +140,14 @@ never `TEBAKO_MOUNT_ROOT`, so the grant would be decorative (the spec
 00 §9 rule). The override-ungranted named error (exit 78) is asserted
 by the boot smoke.
 
-The preload shim (`libtfs_preload.so` from the pinned link unit) still
-rides the image at `lib/tebako/` — openjdk's rationale: the jail's
-host-IO binding is installed by the driver before the exec, and the
-shim keeps the binding coherent across the interpreter's own spawned
-children.
+The preload shim (`libtfs_preload.so` / `libtfs_preload.dylib` from the
+pinned link unit) still rides the image at `lib/tebako/` on POSIX —
+openjdk's rationale: the jail's host-IO binding is installed by the
+driver before the exec, and the shim keeps the binding coherent across
+the interpreter's own spawned children. **windows has no preload tier**
+(the link-unit tarball carries no windows shim), so the windows image
+stages no shim and its layout card omits the `preload_shim` grant — a
+declared-but-absent grant would fail the boot at exit 78.
 
 ## The prune set
 
@@ -147,9 +176,10 @@ broken image.
   runtime launcher (the spec-29 wrapper), byte-identical with the
   pinned release's published asset.
 - `tebako-runtime-<tebako>-julia-<julia>-<triplet>.tfs` — the env
-  image: the pruned julia tree + the preload shim at `lib/tebako/` +
-  the layout card (`lib/tebako/layout.yaml`: era 2, interpreter
-  `/bin/julia`, `visibility: exec-cache`, `preload_shim` path, NO
+  image: the pruned julia tree + the preload shim at `lib/tebako/`
+  (POSIX only) + the layout card (`lib/tebako/layout.yaml`: era 2,
+  interpreter `/bin/julia` (`/bin/julia.exe` on windows),
+  `visibility: exec-cache`, `preload_shim` path (POSIX only), NO
   `mount_root_override` grant) + the L1 payload manifest
   (`__tpkg__/manifest.yaml`). Packed by `tfs mkimage` (the limnifs
   writer — the current default format; a build-time factory tool,
@@ -159,14 +189,16 @@ broken image.
   archive name + its verified sha256, with NO `cflags`: the bytes are
   upstream's — plus the additive `link_unit` block naming the consumed
   product release, the launcher asset, and its release-published
-  digest).
+  digest; the link-unit tarball itself is named only where it was
+  staged — POSIX, for the shim).
 - `<package>.sha256` / `<image>.sha256` — the checksum sidecars next
   to both artifacts, in the tebako store's trust-anchor shape
-  (`"<sha256>  <filename>\n"`).
+  (`"<sha256>  <filename>\n"`). On macOS the sign step rewrites the
+  exe's sidecar to the SIGNED bytes (sign-then-hash).
 
 The `<package>.manifest.json` shard — the release manifest entry with
-the sidecars folded in — arrives with the publish increment, derived at
-publish time (spec 13 §2a's write-once per-leg metadata unit); the
+the sidecars folded in — is derived at publish time by the per-leg
+publish job (spec 13 §2a's write-once per-leg metadata unit); the
 factory emits exactly the sidecars it folds.
 
 ## The flow
@@ -192,10 +224,22 @@ in versions.yml)                    tfs-<ver>-<pid>
         ship the launcher byte-identical as the exe
                         |
                         v
+        macOS only: sign + notarize the exe in-leg (spec 31,
+        gated on APPLE_SIGNING_ENABLED; the exe .sha256 sidecar
+        is rewritten to the SIGNED bytes — sign-then-hash)
+                        |
+                        v
         provenance gate (ci/check_pair_provenance.sh: the byte
-        anchor, the system-only NEEDED closure, the image read-back)
+        anchor (POSIX + windows) / the signed-bytes + signature-chain
+        arm (macOS), the system-only NEEDED closure (ELF), the image
+        read-back)
         boot smoke (tools/boot_smoke: bare/boot/boot-tree/payload/
         compute-floor + bad-mount 69 + TEBAKO_MOUNT_ROOT 65/78 parity)
+                        |
+                        v
+        publish.yml only: per-leg publish + sign (the tebako-release
+        gem), SLSA attest, the .manifest.json shard; the coordinator's
+        release job audits the matrix and renders the registry
 ```
 
 The julia archives are julialang.org's own (no tamatebako julia source
@@ -206,15 +250,18 @@ sibling repos (prebuilt artifacts flow downward).
 
 ## Matrix grammar
 
-The env vocabulary lives in `.github/matrix.json` (one row at the
-skeleton's scope: linux-gnu x86_64 in the digest-pinned tpkg-builder
-container); the version catalog lives in `contract.yml` (the SSOT) —
-versions, tags, and SHAs never appear in workflow YAML. The dispatch
-filters are `julia_filter=full|tidy|catalog|<list>`,
-`platform=linux-gnu` (the trigger fixes it), `arch_filter=all|x86_64|arm64`
-— the sibling factories' grammar, so the next platform's increment
-adds a matrix row (+ its `versions.yml` sources entry), never a
-re-derivation.
+The env vocabulary lives in `.github/matrix.json` (four rows: linux-gnu
+x86_64 in the digest-pinned tpkg-builder container, macos arm64 +
+x86_64 runner-native, windows x64 runner-native); the version catalog
+lives in `contract.yml` (the SSOT) — versions, tags, and SHAs never
+appear in workflow YAML. The dispatch filters are
+`julia_filter=full|tidy|catalog|<list>`,
+`platform=all|linux-gnu|macos|windows` (each trigger fixes its own),
+`arch_filter=all|x86_64|arm64` — the sibling factories' grammar, so the
+next platform's increment adds a matrix row (+ its `versions.yml`
+sources entry), never a re-derivation. linux-musl has no rows because
+upstream ships no musl binaries ≥ 1.11; windows arm64 likewise (no
+upstream archive) — both arrive, if ever, as their own increments.
 
 ## contract.yml — the pins
 
@@ -229,9 +276,14 @@ re-derivation.
   leg spends compute.
 - `link_unit_release: "v2.8.83"` — the tamatebako/tebako release whose
   published launcher + link unit + tfs CLI the legs consume (verified
-  at pin time: the release ships all three for linux-gnu-x86_64; the
-  pin also floors the manifest model the mkimage re-serialization
-  carries — `identity.era` entered the model at v2.8.69).
+  at pin time: the release ships all three for linux-gnu-x86_64,
+  macos-arm64, macos-x86_64, and windows-ucrt64; the pin also floors
+  the manifest model the mkimage re-serialization carries —
+  `identity.era` entered the model at v2.8.69).
+- `release_tooling: "v0.5.2"` — the tamatebako/tebako-release-tooling
+  tag the Gemfile pins (the publish/sign/audit machinery's single
+  owner; the factory's identity + policy ride
+  `scripts/release_adapter.rb`).
 - `julia:` — the version catalog (`catalog` / `full` / `tidy` sets).
   The per-version **source pins** (url + sha256, per triplet) live in
   `versions.yml`; `scripts/check_contract.rb` cross-locks the two (a
@@ -239,7 +291,21 @@ re-derivation.
 
 ## Building locally
 
-The containerized leg, byte-for-byte what CI runs (needs docker;
+A runner-native leg on its own host (macOS arm64 shown; the same
+command shape builds any leg on its matching host — the build fetches
+and verifies every input itself):
+
+```sh
+tools/build_runtime --julia 1.13.4
+stem=runtime-packages/tebako-runtime-$(cat VERSION)-julia-1.13.4-macos-arm64
+ci/check_pair_provenance.sh --exe "$stem" --card "$stem.contract.yaml" \
+  --tfs "$(echo .build/downloads/tfs/*/tfs-*)" --image "$stem.tfs"
+export TEBAKO_RUNTIME_ROOT=runtime-packages
+TEBAKO_TFS=$(echo .build/downloads/tfs/*/tfs-*); export TEBAKO_TFS
+tools/boot_smoke
+```
+
+The containerized linux leg, byte-for-byte what CI runs (needs docker;
 `--platform linux/amd64` on arm64 hosts — under emulation the
 exec-cache materialization and the compute floor run several times
 slower than native):
@@ -291,14 +357,33 @@ runtime-packages` before editing or `git clean`-ing.
   tebako-runtime-php `build/lib` port, repack arm): Contract, Platform,
   JuliaVersion, SourceFetcher, LinkUnit, Launcher, TfsTool, TreeStager,
   ImageBuilder, ImageManifest, ImagePackager, Builder.
-- `ci/check_pair_provenance.sh` — the pair-provenance gate: the exe is
-  byte-identical with the pinned release's launcher (the card's
-  recorded digest), the exe's NEEDED closure is system-only, and the
-  env image reads back under the tfs CLI that wrote it (manifest
-  validates, layout card + `/bin/julia` present).
+- `ci/check_pair_provenance.sh` — the pair-provenance gate, per exe
+  shape (magic-sniffed): ELF + PE carry the byte anchor (the shipped
+  exe IS the pinned release's launcher — the card's recorded digest),
+  ELF adds the system-only NEEDED closure audit; Mach-O anchors the
+  sidecar to the SIGNED bytes and verifies the signature chain
+  (sign-then-hash — the in-leg sign step rewrote them); every platform
+  reads the env image back under the tfs CLI that wrote it (manifest
+  validates, layout card + `/bin/julia[.exe]` present).
+- `ci/macos-sign-notarize-runtime.sh` + `ci/runtime.entitlements` —
+  the spec 31 macOS sign+notarize arm (Developer ID Application,
+  hardened runtime, the entitlement pair; notarize, poll the ticket,
+  quarantine-mark, rewrite the exe sidecar), gated on
+  `APPLE_SIGNING_ENABLED`.
+- `scripts/release_adapter.rb` — this factory's tebako-release
+  declaration (the gem's adapter seam: the version grammar source, the
+  `julia` language segment, the repo identity).
+- `tools/registry_update.rb` — renders `tpkg-registry.yaml` from the
+  release's `.manifest.json` shards (the spec 04 §2 mirror; landed by
+  bot PR from the coordinator's release job).
 - `.github/workflows/_build-platform.yml` — the one per-platform
-  workflow (parity → compute → preflight → build → verify), called by
-  the thin trigger (`build-linux-gnu.yml`).
+  workflow (parity → compute → preflight → build → publish → verify),
+  called by the thin triggers (`build-linux-gnu.yml`,
+  `build-macos.yml`, `build-windows.yml`) and the coordinator.
+- `.github/workflows/publish.yml` — the release coordinator
+  (dispatch-only; `publish` defaults false): the per-platform fan-out
+  plus the ONE release job (the whole-matrix audit, the registry
+  render + bot PR, the aggregate nudge).
 - `.github/workflows/lint.yml` — the static gate: schema validation,
   catalog/matrix resolution, the `ruby -c` sweep, YAML/JSON parse
   checks.
@@ -310,15 +395,21 @@ runtime-packages` before editing or `git clean`-ing.
 
 ## Follow-ups
 
-1. The publish pipeline (`publish.yml` + the release adapter + the
-   registry render — the template's §2.9) and the first release
-   (cutting `v0.1.0` is the owner's call, never the agent's).
-2. The windows leg (upstream ships official windows binaries; the leg
-   adds the spawn-semantics scenarios to `tools/boot_smoke`).
-3. The macos legs (runner-native, the spec 31 sign+notarize arm).
-4. linux-musl + linux-gnu arm64, then the remaining triplets
-   upstream publishes (each: a matrix row + a `versions.yml` sources
-   entry in the same PR).
+1. The first release (cutting `v0.1.0` is the owner's call, never the
+   agent's): the publish pipeline is wired end-to-end but has never
+   been fired — the owner dispatches `publish.yml` (audit first, then
+   the publish run).
+2. linux-gnu arm64 (upstream ships the aarch64 linux archive — a
+   matrix row + a `versions.yml` sources entry in one PR, inside the
+   digest-pinned arm64 tpkg-builder container). windows arm64 has **no
+   upstream archive** (checked against `versions.json` 2026-11-23) —
+   it arrives, if ever, with upstream.
+3. linux-musl — **blocked upstream**: julialang.org publishes no musl
+   binaries ≥ 1.11 (checked against `versions.json` 2026-11-23; musl
+   entries exist only ≤ 1.10.x). A musl julia runtime means a
+   tamatebako source factory compiling musl julia, not a repack row.
+4. windows Authenticode signing (spec 34 — Azure Artifact Signing, the
+   openjdk factory's `tools/windows-sign-gate.sh` arm).
 5. The julialang release monitor (upstream publishes `versions.json` —
    a poll-diff-pin workflow like the sibling factories').
 6. The boot-contract parity suite (`spec/`) against the ruby driver's

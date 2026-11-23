@@ -7,13 +7,15 @@ change any workflow, the build tooling, the matrix computation, or a
 cache key, update this file in the same PR.** A future agent that skips
 this file and "just fixes" a red run is the classic failure mode — read
 it first. (tebako-runtime-php's docs/build-chain.md is the sibling
-reference; this file carries the julia skeleton's subset — the REPACK
+reference; this file carries the julia factory's subset — the REPACK
 arm of docs/factory-template.md §1: nothing in this factory compiles.)
 
 ## The staged hierarchy
 
 One reusable workflow, `_build-platform.yml` (tebako-runtime-php's
-port), called by the thin trigger (`build-linux-gnu.yml`). Stages:
+port), called by the thin triggers (`build-linux-gnu.yml`,
+`build-macos.yml`, `build-windows.yml`) and by the `publish.yml`
+coordinator. Stages:
 
 1. **parity** — the contract gate's driver-source parity arm needs the
    pinned link-unit release's `lib.rs` off raw.githubusercontent.com, a
@@ -29,7 +31,10 @@ port), called by the thin trigger (`build-linux-gnu.yml`). Stages:
    under the dispatch filters. Every downstream value flows from these
    outputs — workflow YAML never hardcodes a version, a tag, or a SHA.
    The run's `SOURCE_DATE_EPOCH` (the HEAD commit's epoch, the ruby#381
-   idiom) is computed here and exported to every leg.
+   idiom) is computed here and exported to every leg, and the
+   `--format env|julias` planner forms feed the publish pipeline's
+   expectation surfaces (`EXPECTED_ENV_MATRIX` /
+   `EXPECTED_JULIA_MATRIX`).
 3. **preflight** — the container digest pin (the ruby#381 idiom, born
    pinned here): `contract.yml container_digests` must equal the ghcr
    registry's CURRENT digest for the tag — per (container × leg arch) —
@@ -38,24 +43,69 @@ port), called by the thin trigger (`build-linux-gnu.yml`). Stages:
    by name instead of moving the environment under the matrix, and a
    failed preflight skips the build legs outright.
 4. **build** — one leg per (julia × arch): `tools/build_runtime` →
+   (macOS only: the spec 31 sign+notarize arm — see below) →
    `ci/check_pair_provenance.sh` → `tools/boot_smoke` → the
-   `runtime-packages-<os>-<arch>-<julia>` artifact. The leg docker-runs
-   the digest-pinned `tpkg-builder` image per step. The `.leg-complete`
-   marker the leg emits on success is the publish increment's
-   completeness gate.
-5. **verify** — the terminal aggregate and the branch-protection gate.
+   `runtime-packages-<os>-<arch>-<julia>` artifact. The linux leg
+   docker-runs the digest-pinned `tpkg-builder` image per step; the
+   macos legs are runner-native (setup-ruby only — the repack arm
+   compiles nothing); the windows leg is runner-native under Git-bash
+   with the runner's hosted ruby and NO msys2 provisioning (julia ships
+   tar.gz with zero symlinks, so Git-bash's GNU tar suffices — the
+   openjdk factory's msys2 need was bsdtar-for-zip + the gcc runtime,
+   neither of which this leg touches; the launcher/tfs artifacts are
+   native static exes). The `.leg-complete` marker the leg emits on
+   success is the publish job's completeness gate.
+5. **publish** — its OWN job (tebako-runtime-ruby#190's split), gated
+   on the `publish` input (default false — only the coordinator's
+   operator-fired runs arm it): the leg that built a package downloads
+   its immutable in-run artifact, verifies `.leg-complete`, and
+   publishes its write-once names (spec 13 §2a's de-rendezvous) via the
+   tebako-release gem (`bundle exec tebako-release upload` — payload +
+   `.sha256` sidecars + the `.manifest.json` shard + the blksum), signs
+   every served name (`tebako-release sign`, spec 09 §5), and attests
+   the bytes (SLSA L3, `actions/attest-build-provenance`). A re-run of
+   a failed publish leg is a minutes-long download + upload, never a
+   rebuild.
+6. **verify** — the terminal aggregate and the branch-protection gate.
    The build legs are a dynamic matrix whose check names shift with the
-   catalog, so protection pins this job's stable check name.
+   catalog, so protection pins this job's stable check name; on
+   publish-armed runs the gate depends on the publish legs too
+   (tebako-runtime-ruby#190's lesson).
 
-The **publish** stage is a named next increment (the template's §2.9):
-`publish.yml` + the release adapter + the registry render, with the
-per-leg publish job rejoining `_build-platform.yml` and the verify gate
-depending on it (tebako-runtime-ruby#190's lesson). No release has been
-cut; the first release is the owner's explicit act.
+The **macOS sign+notarize arm** (spec 31 §5/§8.4 —
+`ci/macos-sign-notarize-runtime.sh`, `ci/runtime.entitlements`) runs
+in-leg between the build and the gates: Developer ID Application +
+hardened runtime + the entitlement pair
+(`disable-library-validation` — the unsigned preload-shim injection —
++ `allow-jit` — julia's LLVM JIT), notarize via the App Store Connect
+key, poll the ticket, quarantine-mark the exe so the boot smoke runs
+under Gatekeeper's exact download path, then **rewrite the exe
+`.sha256` sidecar to the SIGNED bytes** (sign-then-hash — every later
+stage anchors the shipped bytes). Gated on the `APPLE_SIGNING_ENABLED`
+repo variable: anything else ships unsigned BY DESIGN (spec 00
+invariant 7, a loud notice); armed + a missing `APPLE_*` secret is a
+fast named failure. Only the LAUNCHER is signed — the interpreter
+inside the env image keeps upstream's own Developer ID signature
+byte-identical (the repack arm never re-signs upstream bytes; upstream
+julia ships hardened-runtime with its own JIT/injection grants, which
+govern the materialized interpreter process post-exec). windows
+Authenticode signing is the spec 34 increment — NOT this stage: the
+windows exe ships the release's bytes byte-identical and the byte
+anchor holds there.
+
+The **coordinator** (`publish.yml`, dispatch-only, `publish` default
+false) fans out to `_build-platform.yml` per platform and keeps ONE
+release job: the read-only whole-matrix audit (`AUDIT_ONLY=true
+tebako-release upload` per platform that built), the registry render
+(`tools/registry_update.rb` from the release's `.manifest.json`
+shards) landed by bot PR, the aggregate nudge, and the versions ping.
+A `force_rebuild` republication first recreates the release OBJECT
+under the kept tag (tebako-runtime-ruby#189). No release has been cut;
+the first release is the owner's explicit act.
 
 `lint.yml` is the static gate (no builds): the same contract check, the
 catalog/matrix resolution (all three planner formats, so the publish
-increment's expectation surfaces never rot unconsumed), a `ruby -c`
+pipeline's expectation surfaces never rot unconsumed), a `ruby -c`
 sweep over every authored ruby file, and a parse pass over every
 authored YAML/JSON.
 
@@ -73,17 +123,29 @@ authored YAML/JSON.
   the pinned tamatebako/tebako release (`contract.yml
   link_unit_release`), verified against its published `.sha256`
   sidecar. The pair's EXE artifact is this binary, copied
-  byte-identical — the spec-29 wrapper shape (README's driver-link
-  decision).
+  byte-identical on linux and windows — the spec-29 wrapper shape
+  (README's driver-link decision). On macOS the binary is the sign
+  arm's input: the shipped exe is the SIGNED re-stamping of these
+  bytes, and the fetch-verified digest stays in the `.contract.yaml`
+  as consumption provenance.
 - **the link unit** — `link-unit-<ver>-<pid>.tar.gz` from the same
   pinned release, digest-anchored via the release API (the release's
-  SHA256SUMS does not cover it). This factory consumes only
-  `libtfs_preload.so` from it: the shim rides the env image at
-  `lib/tebako/` so the jail's host-IO binding survives the exec into
-  the interpreter (the openjdk rationale).
+  SHA256SUMS does not cover it). **POSIX legs only**: this factory
+  consumes only `libtfs_preload.{so,dylib}` from it — the shim rides
+  the env image at `lib/tebako/` so the jail's host-IO binding
+  survives the exec into the interpreter (the openjdk rationale). The
+  tarball carries no windows shim, and its remaining contents are
+  link-time inputs a repack factory never touches, so the windows leg
+  stages nothing (`LinkUnit#stage` refuses it by name) and the windows
+  layout card omits the `preload_shim` grant.
 - **the tfs CLI** — `tfs-<ver>-<pid>` from the same pinned release,
   sidecar-verified; packs the env image (`tfs mkimage`, the default
   limnifs writer) and the boot smoke's payload fixture.
+- **the release tooling** — the tebako-release gem, git-pinned by the
+  Gemfile to contract.yml's `release_tooling` tag (the publish/sign/
+  audit machinery's single owner — ecosystem invariant 10). The
+  factory's identity + policy ride `scripts/release_adapter.rb` (the
+  gem's adapter seam); the repo carries no copy of the machinery.
 
 An empty pin, a missing asset, or a checksum mismatch are hard named
 errors — this factory has no source-build path for the driver stack
@@ -99,15 +161,21 @@ This repo is a **pure repackager** of pristine upstream binaries. The
 runtime pair is composed, never compiled:
 
 - the EXE is the pin-verified `tebako-runtime-launcher`, copied
-  byte-identical — the provenance gate's byte anchor re-proves the
-  shipped bytes against the release-published digest recorded in the
-  pair's `.contract.yaml` (`link_unit.launcher_sha256`);
+  byte-identical — on linux and windows the provenance gate's byte
+  anchor re-proves the shipped bytes against the release-published
+  digest recorded in the pair's `.contract.yaml`
+  (`link_unit.launcher_sha256`). macOS is the ONE sanctioned
+  re-stamping: the in-leg spec 31 sign+notarize arm rewrites the bytes
+  (a signature is an identity stamp, never a patch — spec 31's own
+  class), the gate's Mach-O arm anchors the SIGNED bytes + the
+  signature chain instead, and the card keeps the fetch-verified
+  digest as consumption provenance;
 - the env image is the upstream tree with the documented prune set
   removed (`include/`, `share/doc/`, `share/man/`,
   `share/applications/`, `share/metainfo/` — README's prune table),
   in-tree symlink chains dereferenced to plain files (the exec-cache
   mirror serves real bytes under SONAME names), plus the preload shim
-  and the layout card, packed by `tfs mkimage`.
+  (POSIX only) and the layout card, packed by `tfs mkimage`.
 
 If a genuine julia source need ever appears (a patch the runtime cannot
 live without), the answer is a tamatebako **source factory** for julia
@@ -153,11 +221,27 @@ anomalously slowly — the regression tripwire, never a benchmark.
 
 The dispatch grammar mirrors the sibling factories': `JULIA_FILTER`
 (`full` | `tidy` | `catalog` | comma-separated versions),
-`PLATFORM_FILTER` (fixed by the trigger), `ARCH_FILTER` (`all` |
-`x86_64` | `arm64`). `scripts/compute_matrix.rb` is the single planner
-CI and the lint gate both exercise.
+`PLATFORM_FILTER` (`all` | `linux-gnu` | `macos` | `windows` — each
+trigger fixes its own; the coordinator passes its slice), `ARCH_FILTER`
+(`all` | `x86_64` | `arm64`). `scripts/compute_matrix.rb` is the single
+planner CI and the lint gate both exercise.
 
-Local build (the containerized leg, matching CI byte-for-byte):
+Local build of a runner-native leg on its own host (macOS arm64 shown —
+the same shape builds any leg on its matching host, and is also how the
+macOS leg's unsigned path behaves when `APPLE_SIGNING_ENABLED` is
+unset):
+
+```sh
+tools/build_runtime --julia 1.13.4
+stem=runtime-packages/tebako-runtime-$(cat VERSION)-julia-1.13.4-macos-arm64
+ci/check_pair_provenance.sh --exe "$stem" --card "$stem.contract.yaml" \
+  --tfs "$(echo .build/downloads/tfs/*/tfs-*)" --image "$stem.tfs"
+export TEBAKO_RUNTIME_ROOT=runtime-packages
+TEBAKO_TFS=$(echo .build/downloads/tfs/*/tfs-*); export TEBAKO_TFS
+tools/boot_smoke
+```
+
+Local build of the containerized linux leg, matching CI byte-for-byte:
 
 ```sh
 docker run --rm --platform linux/amd64 \
@@ -196,16 +280,25 @@ promises: 65 (bare boot with no env image; malformed TEBAKO_MOUNT_ROOT),
 
 ## Where each value lives (SSOT)
 
-- Version catalog + pins (including `container_digests`):
-  `contract.yml` (+ `schema/contract.schema.yml`).
+- Version catalog + pins (including `container_digests`,
+  `link_unit_release`, `release_tooling`): `contract.yml` (+
+  `schema/contract.schema.yml`).
 - Source url/sha256 pins (per version per triplet): `versions.yml`
   (cross-locked to the catalog by `scripts/check_contract.rb`).
 - Env vocabulary (os/arch/host/container): `.github/matrix.json`.
 - The prune set, the layout card (interpreter / visibility: exec-cache
-  / preload_shim), the mount root, the manifest emission:
+  / preload_shim (POSIX only)), the mount root, the manifest emission:
   `build/lib/tebako_julia_builder/` (`image_builder.rb`,
   `image_manifest.rb`, `platform.rb`).
 - The boot-contract scenarios: `tools/boot_smoke`.
+- The macOS signing profile + mechanics: `ci/runtime.entitlements` +
+  `ci/macos-sign-notarize-runtime.sh` (spec 31's fixed pair — never
+  re-derived per factory).
+- The release identity + policy (the gem's adapter seam):
+  `scripts/release_adapter.rb`; the registry render:
+  `tools/registry_update.rb`; the release machinery itself:
+  tamatebako/tebako-release-tooling at contract.yml's
+  `release_tooling` pin (the single owner).
 - The factory-opening recipe (what of this is universal vs
   julia-specific): `docs/factory-template.md`.
 - This architecture: `docs/build-chain.md`.

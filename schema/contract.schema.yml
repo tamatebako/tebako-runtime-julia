@@ -1,13 +1,15 @@
 # JSON Schema (draft 2020-12) for contract.yml — the bootstrap <-> runtime
 # contract version, the tpkg-builder container line (tag + immutable
-# digests), the link-unit release pin, and the julia version catalog.
-# Modeled on tebako-runtime-php's schema/contract.schema.yml; the
-# conditional keys (macos_deployment_target, release_tooling) arrive with
-# their leg/increment classes (docs/factory-template.md §2.1).
+# digests), the link-unit release pin, the release-tooling pin, and the
+# julia version catalog. Modeled on tebako-runtime-php's
+# schema/contract.schema.yml; the conditional keys
+# (macos_deployment_target) arrive with their leg classes
+# (docs/factory-template.md §2.1 — the repack arm compiles nothing, so it
+# carries no deployment-target floor: the launcher ships product bytes).
 $schema: "https://json-schema.org/draft/2020-12/schema"
 title: tebako-runtime-julia bootstrap <-> runtime contract
 type: object
-required: [contract_version, container_version, container_digests, link_unit_release, julia]
+required: [contract_version, container_version, container_digests, link_unit_release, release_tooling, julia]
 additionalProperties: false
 properties:
   contract_version:
@@ -36,6 +38,10 @@ properties:
     type: string
     pattern: '^v\d+\.\d+\.\d+$'
     description: the tamatebako/tebako release whose published link unit (preload shim) + runtime launcher + tfs CLI the legs consume
+  release_tooling:
+    type: string
+    pattern: '^v\d+\.\d+\.\d+$'
+    description: the tamatebako/tebako-release-tooling tag the Gemfile pins (the release machinery's single owner; consumed by the publish/sign legs and the coordinator's audit)
   julia:
     type: object
     required: [catalog, full, tidy]

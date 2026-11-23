@@ -33,9 +33,14 @@ module TebakoJuliaBuilder
   # (libtfs_preload.{so,dylib}), staged into the env image so the jail's
   # host-IO binding survives the exec into the interpreter (spec 22 §3
   # rules E2/E3 — the openjdk factory's consumption, tebako-runtime-php's
-  # LinkUnit trust anchor). The driver link itself is NOT this factory's
-  # to compose: the pair's exe is the shipped tebako-runtime-launcher
-  # (Launcher), and a repack factory never compiles.
+  # LinkUnit trust anchor). WINDOWS LEGS STAGE NOTHING: the link-unit
+  # tarball carries no windows preload tier (its remaining contents are
+  # link-time inputs, and a repack factory never links), so the Builder
+  # never calls #stage there — verified-but-unconsumed bytes would be
+  # decorative provenance (spec 00 §9). The driver link itself is NOT
+  # this factory's to compose: the pair's exe is the shipped
+  # tebako-runtime-launcher (Launcher), and a repack factory never
+  # compiles.
   #
   # Trust anchor: the GitHub release API's per-asset `digest` field — the
   # release SHA256SUMS does NOT cover the link-unit assets. A checksum
@@ -59,8 +64,16 @@ module TebakoJuliaBuilder
 
     # Download + verify + extract the unit into dest; returns dest.
     # Idempotent: a dest whose marker names this asset's verified sha256
-    # is reused as-is.
+    # is reused as-is. POSIX only — a windows leg has no consumption
+    # (the class comment); calling #stage there is a config bug.
     def stage(dest)
+      if @platform.msys?
+        raise TebakoJuliaBuilder::Error.new(
+          "the link unit is POSIX-only consumption (the preload shim) — the windows leg stages " \
+          "nothing (Builder gates the call); being here is a config bug", 123
+        )
+      end
+
       expected = expected_digest
       marker = File.join(dest, ".sha256")
       if File.file?(marker) && File.read(marker).strip == expected && complete?(dest)
