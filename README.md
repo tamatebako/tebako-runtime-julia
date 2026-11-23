@@ -280,7 +280,7 @@ upstream archive) — both arrive, if ever, as their own increments.
   macos-arm64, macos-x86_64, and windows-ucrt64; the pin also floors
   the manifest model the mkimage re-serialization carries —
   `identity.era` entered the model at v2.8.69).
-- `release_tooling: "v0.5.2"` — the tamatebako/tebako-release-tooling
+- `release_tooling: "v0.5.3"` — the tamatebako/tebako-release-tooling
   tag the Gemfile pins (the publish/sign/audit machinery's single
   owner; the factory's identity + policy ride
   `scripts/release_adapter.rb`).

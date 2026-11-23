@@ -93,9 +93,12 @@ link_unit_release: "v2.8.83"
 # 10); the Gemfile reads THIS value (one contract edit bumps the pin,
 # never a second hand-written copy). The factory's identity + policy ride
 # scripts/release_adapter.rb — the repo carries no copy of the machinery.
-# v0.5.2 is the current tag (the transient-retry fixes over
-# tebako-runtime-php's proven v0.5.1 — tebako#1048).
-release_tooling: "v0.5.2"
+# v0.5.3 is the current tag: the windows completeness gate consults the
+# adapter's dll_install_name declaration, so an exec-cache runtime (the
+# openjdk shape — this factory) is no longer demanded a .dll facet it
+# never publishes (the first v0.1.0 publish, run 45169138993, died on
+# the unconditional expectation).
+release_tooling: "v0.5.3"
 
 # The julia version catalog this factory builds (and will publish, once
 # the publish increment lands). The SOURCE PINS (url/sha256 per version
