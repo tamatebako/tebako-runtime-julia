@@ -24,12 +24,12 @@
 # POSSIBILITY OF SUCH DAMAGE.
 
 # The ONE per-platform build workflow (tebako-runtime-php's
-# _build-platform.yml port, at this factory's skeleton scope — the repack
-# arm: nothing compiles here, and the skeleton carries one containerized
-# linux-gnu x86_64 leg; the musl/macos/windows legs and the publish job
-# are named next increments — docs/factory-template.md §2.9, §3.10).
-# Called by the thin platform trigger (build-linux-gnu.yml) — never
-# dispatched directly.
+# _build-platform.yml port, at this factory's scope — the repack arm:
+# nothing compiles here; the legs are one containerized linux-gnu x86_64
+# leg plus the runner-native macos arm64/x86_64 and windows x64 legs; no
+# musl legs — upstream ships no musl julia ≥ 1.11). Called by the thin
+# platform triggers (build-<platform>.yml) and by the publish.yml
+# coordinator — never dispatched directly.
 #
 # Stage 0 (parity): the contract gate's driver-source parity arm needs the
 #   pinned link-unit release's lib.rs — a raw.githubusercontent.com fetch
@@ -52,19 +52,38 @@
 #   before any leg spends compute; the legs then pull name:tag@digest, so
 #   the toolchain container can never move under the matrix.
 # Stage 3 (build): one leg per (julia x arch) of this platform:
-#   tools/build_runtime -> ci/check_pair_provenance.sh ->
-#   tools/boot_smoke -> the runtime-packages-<os>-<arch>-<julia>
-#   artifact. The build fetches and sha256-verifies every input itself
-#   (the pinned julia prebuilt archive off versions.yml, the pinned link
-#   unit + launcher + tfs CLI off the product release) — there is NO
-#   source-build path for the driver stack here (contract.yml's
-#   link_unit_release comment), so the ruby factory's whole link-unit
-#   staging job has no counterpart. The publish stage is the next
-#   increment: the .leg-complete marker this stage emits is its
-#   completeness gate when it lands (docs/factory-template.md §2.9).
+#   tools/build_runtime -> the macOS sign+notarize arm (spec 31, gated on
+#   APPLE_SIGNING_ENABLED — the sign step rewrites the exe .sha256
+#   sidecar to the SIGNED bytes, sign-then-hash) ->
+#   ci/check_pair_provenance.sh -> tools/boot_smoke -> the
+#   runtime-packages-<os>-<arch>-<julia> artifact. The build fetches and
+#   sha256-verifies every input itself (the pinned julia prebuilt archive
+#   off versions.yml, the pinned link unit (POSIX) + launcher + tfs CLI
+#   off the product release) — there is NO source-build path for the
+#   driver stack here (contract.yml's link_unit_release comment), so the
+#   ruby factory's whole link-unit staging job has no counterpart.
+# Stage 4 (publish + sign): the publish job — one leg per (julia x arch),
+#   re-running THIS leg's artifact handoff. The leg that built a package
+#   publishes it (the tebako-release gem's uploader) and signs its served
+#   names (the gem's signer) — spec 13 §2a's de-rendezvous
+#   (tebako-runtime-ruby#161's pattern): write-once per-leg names, no
+#   shared release-asset mutation, so N legs publish concurrently with
+#   zero rendezvous and one failed leg no longer blocks the green legs'
+#   packages. The publish job is a SEPARATE job from the build
+#   (tebako-runtime-ruby#190): GitHub's re-run granularity is the job, so
+#   a publish-layer failure re-runs as a minutes-long download + upload,
+#   never a rebuild. The coordinator (publish.yml) keeps ONE release job:
+#   the read-only audit of the whole matrix against the release.
 #
 # Container grammar (the php factory's): the linux legs run on the ubuntu
-# host and docker-run the tpkg-builder image per step.
+# host and docker-run the tpkg-builder image per step. The macos legs are
+# runner-native (nothing to provision beyond ruby — the repack arm
+# compiles nothing, so the toolchain is the runner's own). The windows
+# leg is runner-native under Git-bash with the runner's hosted ruby (the
+# openjdk factory's idiom): julia ships tar.gz with zero symlinks (Git-
+# bash's GNU tar suffices — the openjdk msys2 need was bsdtar-for-zip +
+# the gcc runtime, neither of which this leg touches), and the driver/
+# launcher/tfs artifacts are native static exes.
 #
 # The cache holds ONLY the sha256-verified downloads (.build/downloads)
 # and the staged link unit (.build/link-unit): a restored entry re-verifies
@@ -79,7 +98,7 @@ on:
   workflow_call:
     inputs:
       platform:
-        description: 'This call''s platform: linux-gnu (the skeleton''s only leg)'
+        description: 'This call''s platform: linux-gnu | macos | windows'
         required: true
         type: string
       julia_filter:
@@ -90,6 +109,27 @@ on:
         description: 'Arch slice: "all" or an arch (x86_64 | arm64)'
         type: string
         default: 'all'
+      audit:
+        description: 'Audit only: compute the legs, build nothing (publish.yml''s audit mode)'
+        type: boolean
+        default: false
+      publish:
+        description: 'Publish each leg''s runtime package to the release and sign its served names (spec 13 §2a / spec 09 §5)'
+        type: boolean
+        default: false
+    outputs:
+      run:
+        description: '"true" when this platform has legs under the filters (set in audit mode too — the audit reads the expectations)'
+        value: ${{ jobs.compute.outputs.run }}
+      tebako_version:
+        description: 'The runtime package version (the VERSION file)'
+        value: ${{ jobs.compute.outputs.tebako_version }}
+      env_matrix:
+        description: 'The selected matrix.json rows (+ host_id) as JSON — the release job''s EXPECTED_ENV_MATRIX'
+        value: ${{ jobs.compute.outputs.env_matrix }}
+      julia_matrix:
+        description: 'The selected julia versions as JSON — the release job''s EXPECTED_JULIA_MATRIX'
+        value: ${{ jobs.compute.outputs.julia_matrix }}
 
 env:
   CACHE_VER: 1
@@ -116,6 +156,9 @@ jobs:
       - name: Fetch the pinned driver's parity source
         run: bundle exec scripts/check_contract.rb --fetch-parity .build/parity/lib.rs
 
+      # Artifact names are per workflow RUN: publish.yml calls this
+      # workflow once per platform inside one run, so the platform suffix
+      # keeps the three calls' artifacts distinct.
       - name: Upload the parity source
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -132,6 +175,8 @@ jobs:
       leg_count: ${{ steps.emit.outputs.leg_count }}
       legs: ${{ steps.emit.outputs.legs }}
       tebako_version: ${{ steps.emit.outputs.tebako_version }}
+      env_matrix: ${{ steps.emit.outputs.env_matrix }}
+      julia_matrix: ${{ steps.emit.outputs.julia_matrix }}
       container_version: ${{ steps.emit.outputs.container_version }}
       container_digests: ${{ steps.emit.outputs.container_digests }}
       source_date_epoch: ${{ steps.get-sde.outputs.epoch }}
@@ -186,6 +231,8 @@ jobs:
               abort("contract.yml declares no container_digests") if d.nil? || d.empty?
               print JSON.generate(d)
             ')"
+            echo "env_matrix=$(scripts/compute_matrix.rb --format env)"
+            echo "julia_matrix=$(scripts/compute_matrix.rb --format julias)"
           } >> "$GITHUB_OUTPUT"
           # Mirror the plan to the LOG: values written only to
           # $GITHUB_OUTPUT leave no diagnosable record when the legs skip.
@@ -262,10 +309,11 @@ jobs:
   build:
     name: ${{ matrix.julia }} / ${{ matrix.os }}-${{ matrix.arch }}
     needs: [compute, preflight]
-    # An unguarded empty matrix poisons the run conclusion. No always()
-    # here: a FAILED preflight (a moved toolchain container) must skip
-    # the legs outright — the verify job reports it by name.
-    if: ${{ needs.compute.outputs.run == 'true' }}
+    # An unguarded empty matrix poisons the run conclusion; an audit run
+    # builds nothing (publish.yml's audit mode verifies the RELEASE). No
+    # always() here: a FAILED preflight (a moved toolchain container)
+    # must skip the legs outright — the verify job reports it by name.
+    if: ${{ needs.compute.outputs.run == 'true' && !inputs.audit }}
     runs-on: ${{ matrix.host }}
     # A hung leg fails loudly at the cap, never silently (the ruby
     # factory's 150-minute record is the reference).
@@ -287,6 +335,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Create folder for runtime packages
+        # bash on every OS (Git-bash on windows) — the windows default
+        # pwsh would read `-p` its own way.
+        shell: bash
         run: mkdir -p runtime-packages
 
       - name: Cache the verified downloads + the staged link unit
@@ -298,13 +349,24 @@ jobs:
           key: tebako-julia-dl-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('contract.yml', 'versions.yml') }}-v${{ env.CACHE_VER }}
           save-always: true
 
-      # --- build (the container leg docker-runs the digest-pinned
+      # --- provisioning (the host-native macos legs only; the container
+      # legs' toolchain is baked into the tpkg-builder image, and the
+      # windows leg's hosted ruby + Git-bash suffice — the header) ------
+      - name: Setup Ruby (the build tooling's interpreter)
+        if: matrix.os == 'macos'
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+        with:
+          ruby-version: '3.3'
+          bundler-cache: false
+
+      # --- build (the container legs docker-run the digest-pinned
       # tpkg-builder image per step — the preflight proved the pin) -------
       # --arch + --link-unit-pid are passed explicitly: the leg's DECLARED
       # coordinates beat the tooling process's self-report (under
       # emulation host_cpu can lie), and the product-asset platform id is
       # the planner's, never a re-derivation inside the container.
-      - name: Build the runtime
+      - name: Build the runtime (container legs)
+        if: matrix.container != null
         env:
           CONTAINER_DIGESTS: ${{ needs.compute.outputs.container_digests }}
         run: |
@@ -338,9 +400,56 @@ jobs:
               uid=$(stat -c %u /mnt/w/contract.yml); gid=$(stat -c %g /mnt/w/contract.yml)
               chown -R "$uid:$gid" /mnt/w/.build /mnt/w/runtime-packages 2>/dev/null || true'
 
-      # --- the gates (a red gate fails the leg; the .leg-complete marker
-      # below is the publish increment's completeness gate) --------------
-      - name: Check the pair's provenance
+      - name: Build the runtime (macos)
+        if: matrix.os == 'macos'
+        run: |
+          set -euo pipefail
+          mkdir -p .build
+          tools/build_runtime --julia "${{ matrix.julia }}" --arch "${{ matrix.arch }}" \
+            --link-unit-pid "${{ matrix.link_unit_pid }}" 2>&1 | tee .build/build.log
+
+      # Git-bash + the runner's hosted ruby (the header): the tooling is
+      # stdlib-only, and every artifact it executes (the launcher, the
+      # tfs CLI) is a native static exe — no msys2 provisioning (julia
+      # ships tar.gz, so Git-bash's GNU tar suffices).
+      - name: Build the runtime (windows)
+        if: matrix.os == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .build
+          tools/build_runtime --julia "${{ matrix.julia }}" --arch "${{ matrix.arch }}" \
+            --link-unit-pid "${{ matrix.link_unit_pid }}" 2>&1 | tee .build/build.log
+
+      # Spec 31 §5/§8.4: sign (Developer ID Application, hardened
+      # runtime, the ci/runtime.entitlements pair) + notarize the macOS
+      # runtime exe IN-LEG, before the provenance gate and the boot
+      # smoke — every downstream gate, and the publish stage's .sha256
+      # sidecar, anchors the exact SIGNED bytes (sign-then-hash is
+      # mandatory; the sign step rewrites the sidecar itself). Gated on
+      # the repo variable APPLE_SIGNING_ENABLED (unsigned stays
+      # first-class without it — spec 00 invariant 7; armed + a missing
+      # secret is a fast named failure).
+      - name: Sign + notarize the runtime exe (macos, spec 31)
+        if: matrix.os == 'macos'
+        shell: bash
+        env:
+          APPLE_SIGNING_ENABLED: ${{ vars.APPLE_SIGNING_ENABLED }}
+          APPLE_DEVELOPER_ID_P12: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ASC_KEY_P8: ${{ secrets.APPLE_ASC_KEY_P8 }}
+          APPLE_ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+          APPLE_ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          runtime="tebako-runtime-${{ needs.compute.outputs.tebako_version }}-julia-${{ matrix.julia }}-${{ matrix.host_id }}"
+          bash ci/macos-sign-notarize-runtime.sh "runtime-packages/$runtime"
+
+      # --- the gates (a red gate skips the publish below, and the
+      # release job's audit then fails the run loudly) ------------------
+      - name: Check the pair's provenance (container legs)
+        if: matrix.container != null
         env:
           CONTAINER_DIGESTS: ${{ needs.compute.outputs.container_digests }}
         run: |
@@ -361,10 +470,37 @@ jobs:
               ci/check_pair_provenance.sh --exe "$stem" --card "$stem.contract.yaml" \
                 --tfs "$(echo .build/downloads/tfs/*/tfs-*)" --image "$stem.tfs"'
 
+      # The Mach-O arm of the gate keys off APPLE_SIGNING_ENABLED (the
+      # unsigned path stays first-class; armed, it asserts the signature
+      # chain + the entitlement pair + the ticket's visibility).
+      - name: Check the pair's provenance (macos)
+        if: matrix.os == 'macos'
+        env:
+          APPLE_SIGNING_ENABLED: ${{ vars.APPLE_SIGNING_ENABLED }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          stem="runtime-packages/tebako-runtime-${{ needs.compute.outputs.tebako_version }}-julia-${{ matrix.julia }}-${{ matrix.host_id }}"
+          ci/check_pair_provenance.sh --exe "$stem" --card "$stem.contract.yaml" \
+            --tfs "$(echo .build/downloads/tfs/*/tfs-*)" --image "$stem.tfs"
+
+      # Git-bash: the gate's tfs calls are native exes — the gate itself
+      # wraps them with MSYS2_ARG_CONV_EXCL + cygpath (its header).
+      - name: Check the pair's provenance (windows)
+        if: matrix.os == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stem="runtime-packages/tebako-runtime-${{ needs.compute.outputs.tebako_version }}-julia-${{ matrix.julia }}-${{ matrix.host_id }}"
+          ci/check_pair_provenance.sh --exe "$stem.exe" --card "$stem.contract.yaml" \
+            --tfs "$(echo .build/downloads/tfs/*/tfs-*)" --image "$stem.tfs"
+
       # The boot smoke resolves the exe from TEBAKO_RUNTIME_ROOT.
       # TEBAKO_TFS names the tfs CLI the build fetched (the payload
-      # scenario's fixture image packs with it).
-      - name: Boot smoke
+      # scenario's fixture image packs with it) — inside the container
+      # legs it is the gnu binary matching the image.
+      - name: Boot smoke (container legs)
+        if: matrix.container != null
         env:
           CONTAINER_DIGESTS: ${{ needs.compute.outputs.container_digests }}
         run: |
@@ -386,22 +522,44 @@ jobs:
               export TEBAKO_TFS
               tools/boot_smoke'
 
+      - name: Boot smoke (macos)
+        if: matrix.os == 'macos'
+        env:
+          TEBAKO_RUNTIME_ROOT: runtime-packages
+        run: |
+          set -euo pipefail
+          TEBAKO_TFS=$(echo .build/downloads/tfs/*/tfs-*)
+          export TEBAKO_TFS
+          tools/boot_smoke
+
+      - name: Boot smoke (windows)
+        if: matrix.os == 'windows'
+        shell: bash
+        env:
+          TEBAKO_RUNTIME_ROOT: runtime-packages
+        run: |
+          set -euo pipefail
+          TEBAKO_TFS=$(echo .build/downloads/tfs/*/tfs-*)
+          export TEBAKO_TFS
+          tools/boot_smoke
+
       # The leg-complete marker (tebako-runtime-ruby#190): written only
       # when every gate above passed — a failed step stops the job before
       # this point (default step gating). The diagnostics upload below is
       # always(), so a red leg's partial packages DO ship as an artifact;
-      # the publish increment's job refuses any artifact without this
-      # marker.
+      # the publish job refuses any artifact without this marker.
       - name: Mark the leg complete
         shell: bash
         run: touch runtime-packages/.leg-complete
 
-      # The leg's workspace, kept for a day as build diagnostics: one
+      # The leg's workspace, kept for a day as build diagnostics AND as
+      # the publish job's input (tebako-runtime-ruby#190's split): one
       # artifact per (platform, arch, julia) leg, immutable across the
-      # run's attempts. Uploads even when the build or boot smoke failed
+      # run's attempts — a re-run publish leg re-downloads exactly these
+      # bytes. Uploads even when the build or boot smoke failed
       # (always()) — a red leg's packages are exactly the ones worth
       # diagnosing; the .leg-complete marker above is what keeps them
-      # unpublished when the publish increment lands.
+      # unpublished.
       - name: Upload the runtime packages
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -409,13 +567,13 @@ jobs:
           name: runtime-packages-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.julia }}
           # include-hidden-files: the .leg-complete marker is dot-hidden
           # (upload-artifact excludes dotfiles by default since v4.4) and
-          # IS the publish increment's completeness gate.
+          # IS the publish job's completeness gate.
           include-hidden-files: true
           path: runtime-packages
           retention-days: 1
 
       # The build log is the leg's fetch/stage/pack evidence — the step
-      # log interleaves the docker wrapper, so the leg's own answers live
+      # log interleaves the shell wrapper, so the leg's own answers live
       # here. Retained a week (text, near-free), not the packages' 1d.
       - name: Upload the build log
         if: always()
@@ -426,19 +584,121 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  # Spec 13 §2a (the de-rendezvous, tebako-runtime-ruby#161's pattern) as
+  # its OWN job (tebako-runtime-ruby#190): the leg that built a package
+  # publishes it — payload assets + .sha256 sidecars + the .manifest.json
+  # shard, write-once names this leg owns alone — and then signs every
+  # served name (spec 09 §5's no-fold rule). No shared file exists, so N
+  # legs publish concurrently with zero rendezvous. The split is the
+  # recovery story: GitHub's re-run granularity is the job, so a
+  # publish-layer failure re-runs as a minutes-long download + upload of
+  # the immutable in-run artifact — never a rebuild (the 2026-09-23
+  # wedge cost a full-catalog rebuild before this job existed).
+  publish:
+    name: publish ${{ matrix.julia }} / ${{ matrix.os }}-${{ matrix.arch }}
+    needs: [compute, build]
+    # always(): one failed build leg must not skip the GREEN legs'
+    # publishes — the de-rendezvous holds across jobs. A leg whose build
+    # failed ships no complete artifact; its publish leg fails named at
+    # the guards below.
+    if: ${{ always() && !cancelled() && needs.compute.outputs.run == 'true' && inputs.publish && !inputs.audit }}
+    # attestations/id-token: the SLSA L3 provenance arm at the leg tail
+    # (gated with the publish — the job's own if — so build/audit runs
+    # never attest).
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    # Runner-native on ubuntu-latest for every leg: the uploader is pure
+    # API work, and the signer auto-detects THIS host's tebako-pkg
+    # (linux-gnu-x86_64) — an OpenPGP detached signature over served bytes
+    # is host-independent.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.compute.outputs.legs) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download the leg's runtime packages
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: runtime-packages-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.julia }}
+          path: runtime-packages
+
+      - name: Guard the artifact's completeness
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.download.outcome }}" != "success" ]; then
+            echo "::error::no runtime-packages artifact for this leg — its build leg did not complete"
+            echo "(a loudly-skipped or failed build publishes nothing; fix the build leg, then re-run failed jobs)"
+            exit 1
+          fi
+          if [ ! -f runtime-packages/.leg-complete ]; then
+            echo "::error::the leg's artifact carries no .leg-complete marker — the build leg died before its gates passed; these partial bytes are not publishable"
+            exit 1
+          fi
+
+      - name: Setup Ruby (the release tooling)
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+
+      - name: Publish the leg's runtime package (spec 13 §2a)
+        shell: bash
+        env:
+          # The job-level runner GITHUB_TOKEN authenticates the release
+          # API calls (see publish.yml's header).
+          TEBAKO_VERSION: ${{ needs.compute.outputs.tebako_version }}
+          EXPECTED_ENV_MATRIX: '[{"os":"${{ matrix.os }}","arch":"${{ matrix.arch }}"}]'
+          EXPECTED_JULIA_MATRIX: '["${{ matrix.julia }}"]'
+          TEBAKO_RELEASE_SIGNING_ENABLED: ${{ vars.TEBAKO_RELEASE_SIGNING_ENABLED }}
+          TEBAKO_RELEASE_SIGNING_KEYID: ${{ vars.TEBAKO_RELEASE_SIGNING_KEYID }}
+        run: |
+          set -euo pipefail
+          bundle exec tebako-release upload
+
+      - name: Sign the leg's release assets (spec 09 §5)
+        shell: bash
+        env:
+          TEBAKO_VERSION: ${{ needs.compute.outputs.tebako_version }}
+          TEBAKO_RELEASE_SIGNING_ENABLED: ${{ vars.TEBAKO_RELEASE_SIGNING_ENABLED }}
+          TEBAKO_RELEASE_SIGNING_KEY: ${{ secrets.TEBAKO_RELEASE_SIGNING_KEY }}
+          SIGN_ONLY_STEMS: tebako-runtime-${{ needs.compute.outputs.tebako_version }}-julia-${{ matrix.julia }}-${{ matrix.host_id }}
+        run: bundle exec tebako-release sign
+
+      # SLSA L3 provenance over the exact bytes this leg ships — the staged
+      # runtime package + its .sha256 sidecars + the .manifest.json shard
+      # (plus the detached .asc when the signing arm ran: the signer
+      # converges them into this same dir). The .leg-complete marker is
+      # dot-hidden, so the glob never names it. Gated with the publish
+      # above (the job's own if) — build/audit runs never attest.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: runtime-packages/*
+
   # The terminal aggregate — and the branch-protection gate. The build
   # legs are a dynamic matrix whose check names shift with the catalog
   # (a version bump renames every leg), so protection pins this job's
   # stable per-platform check name ("<platform> / all legs green")
   # instead of any leg's. Green means: the contract/matrix computed, the
-  # container pins proved, and every emitted leg succeeded; a platform
-  # whose filter emits no legs gates on compute alone. When the publish
-  # increment lands its job joins this gate (tebako-runtime-ruby#190's
-  # lesson: the gate depends on the publish jobs, not only the builds).
+  # container pins proved, every emitted leg succeeded, and — on publish
+  # runs — every publish leg landed (tebako-runtime-ruby#190: the gate
+  # depends on the publish jobs, not only the builds); a platform whose
+  # filter emits no legs gates on compute alone. Audit runs (publish.yml's
+  # audit mode) build nothing and skip this job.
   verify:
     name: all legs green
-    needs: [parity, compute, preflight, build]
-    if: ${{ always() && !cancelled() }}
+    needs: [parity, compute, preflight, build, publish]
+    if: ${{ always() && !cancelled() && !inputs.audit }}
     runs-on: ubuntu-latest
     steps:
       - name: Gate on the legs
@@ -448,6 +708,7 @@ jobs:
           echo "compute:   ${{ needs.compute.result }} (run=${{ needs.compute.outputs.run }}, legs=${{ needs.compute.outputs.leg_count }})"
           echo "preflight: ${{ needs.preflight.result }}"
           echo "build:     ${{ needs.build.result }}"
+          echo "publish:   ${{ needs.publish.result }} (requested=${{ inputs.publish }})"
           if [ "${{ needs.compute.result }}" != "success" ]; then
             echo "::error::the contract/matrix computation failed"
             exit 1
@@ -458,5 +719,12 @@ jobs:
           fi
           if [ "${{ needs.compute.outputs.run }}" = "true" ] && [ "${{ needs.build.result }}" != "success" ]; then
             echo "::error::not every ${{ inputs.platform }} leg succeeded: ${{ needs.build.result }}"
+            exit 1
+          fi
+          # A publish-requested run gates on the publish legs too (the job
+          # is skipped outright when publish was not requested — that is
+          # the success() semantics for a non-publish run).
+          if [ "${{ inputs.publish }}" = "true" ] && [ "${{ needs.compute.outputs.run }}" = "true" ] && [ "${{ needs.publish.result }}" != "success" ]; then
+            echo "::error::not every ${{ inputs.platform }} publish leg succeeded: ${{ needs.publish.result }}"
             exit 1
           fi

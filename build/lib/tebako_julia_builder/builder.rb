@@ -32,12 +32,13 @@ module TebakoJuliaBuilder
   # End-to-end runtime package build (tools/build_runtime): fetch +
   # verify the official prebuilt julia archive (sha256 against
   # versions.yml's pins — the repack arm: no compilation), stage the
-  # pin-verified link unit (the preload shim), the runtime launcher, and
+  # pin-verified link unit (POSIX — for the preload shim; windows has
+  # no preload tier and stages nothing), the runtime launcher, and
   # the tfs CLI (all from the pinned tamatebako/tebako release), stage +
   # prune the julia tree, assemble + pack the env image
   # (ImageBuilder/ImagePackager), and emit the pair with its sidecars
   # (the store-shape .sha256 for both artifacts, the era-2
-  # .contract.yaml provenance card the publish increment will fold into
+  # .contract.yaml provenance card the publish increment folds into
   # the manifest entry).
   class Builder
     # The era-2 contract card constants (spec 18 C2): what this factory
@@ -74,12 +75,15 @@ module TebakoJuliaBuilder
       (tarball, sha256) = fetcher.fetch(@julia.base_version, @platform.tpkg_triplet)
       puts "-- Building tebako runtime for julia #{@julia_version} " \
            "(tebako #{@tebako_version}, #{@platform.host_id}, #{File.basename(tarball)})"
-      link_unit_dir = link_unit.stage(File.join(@prefix, "link-unit"))
+      # The link unit's only repack consumption is the POSIX preload
+      # shim (LinkUnit's class comment) — windows stages nothing.
+      link_unit_dir = @platform.posix? ? link_unit.stage(File.join(@prefix, "link-unit")) : nil
       (launcher_path, launcher_sha256) = launcher.fetch
       tfs = tfs_tool.fetch
       staged = TebakoJuliaBuilder::TreeStager.new(prefix: @prefix, tarball: tarball, src_sha256: sha256,
                                                   julia_version: @julia.base_version,
-                                                  triplet: @platform.tpkg_triplet).stage
+                                                  triplet: @platform.tpkg_triplet,
+                                                  platform: @platform).stage
       finalize(launcher_path)
       assemble_and_pack_image(staged, sha256, link_unit, link_unit_dir, tfs)
       write_sidecars(launcher_sha256)
@@ -166,20 +170,24 @@ module TebakoJuliaBuilder
     # timing tripwire); the additive link_unit block names the consumed
     # product release's assets, including the launcher's
     # release-published digest (the provenance gate's byte anchor —
-    # open parse: consumers that predate the key ignore it).
+    # open parse: consumers that predate the key ignore it). The
+    # link-unit tarball itself is named only where it was staged
+    # (POSIX — the preload shim; windows consumes nothing from it, and
+    # a card naming unconsumed bytes would be decorative provenance).
     def write_contract_sidecar(tarball, sha256, link_unit, launcher, launcher_sha256)
+      link_unit_block = {
+        "release" => @link_unit_release,
+        "launcher" => launcher.asset_name,
+        "launcher_sha256" => launcher_sha256
+      }
+      link_unit_block["asset"] = link_unit.asset_name if @platform.posix?
       card = CONTRACT_CARD.merge(
         "mount_root" => @platform.mount_root,
         "built_from" => {
           "pin" => "versions.yml",
           "sources" => [{ "name" => File.basename(tarball), "sha256" => sha256 }]
         },
-        "link_unit" => {
-          "release" => @link_unit_release,
-          "asset" => link_unit.asset_name,
-          "launcher" => launcher.asset_name,
-          "launcher_sha256" => launcher_sha256
-        }
+        "link_unit" => link_unit_block
       )
       File.write("#{output.sub(/\.exe\z/, "")}.contract.yaml", YAML.dump(card))
     end

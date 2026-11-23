@@ -28,12 +28,19 @@ workspace root) — read it first. The short version as applied here:
 `tools/build_runtime` is implemented (the tebako-runtime-php
 `build/lib` port, repack arm): fetch/verify → stage/prune → env-image
 pack → the launcher shipped byte-identical → sidecars, gated by
-`ci/check_pair_provenance.sh` and `tools/boot_smoke`. CI carries one
-platform workflow (`build-linux-gnu.yml` — a thin trigger over
-`_build-platform.yml`: parity → compute → preflight → build → verify)
-plus the static gate (`lint.yml`). There is deliberately **no
-publish pipeline, no release, no tag** — those are named increments
-(README's status block); the first release is the owner's explicit act.
+`ci/check_pair_provenance.sh` and `tools/boot_smoke`. CI carries three
+platform workflows (`build-linux-gnu.yml`, `build-macos.yml`,
+`build-windows.yml` — thin triggers over `_build-platform.yml`: parity
+→ compute → preflight → build → publish → verify) plus the static gate
+(`lint.yml`). The macOS legs run the spec 31 sign+notarize arm
+(`ci/macos-sign-notarize-runtime.sh`, gated on the
+`APPLE_SIGNING_ENABLED` repo variable; the sign step rewrites the exe
+`.sha256` sidecar to the SIGNED bytes — sign-then-hash). The publish
+pipeline (`publish.yml` + the tebako-release gem via
+`scripts/release_adapter.rb` + `tools/registry_update.rb`) is present
+but **never fired — no release, no tag**: the first release is the
+owner's explicit act (README's status block names the remaining
+increments).
 
 ## Repo-local gotchas
 
@@ -45,7 +52,8 @@ publish pipeline, no release, no tag** — those are named increments
   `schema/contract.schema.yml` (`bundle exec`), including the
   driver-source parity arm (contract.yml ↔ the pinned link-unit
   release's compiled-in `TEBAKO_CONTRACT_VERSION`). A contract bump
-  edits both in the same commit.
+  edits both in the same commit. The Gemfile's tebako-release pin reads
+  contract.yml's `release_tooling` — never a second hand-written copy.
 - CI containers are `ghcr.io/tamatebako/tpkg-builder-*`
   (tebako-ci-containers) only, pulled `name:tag@digest`; the archived
   v1 `tebako-<platform>` images are never referenced here.
@@ -60,8 +68,16 @@ publish pipeline, no release, no tag** — those are named increments
   several times slower than native — do not "fix" a ceiling trip that
   only reproduces under qemu; note it as an emulation artifact.
 - The exe artifact is the product's `tebako-runtime-launcher`, shipped
-  byte-identical (README's driver-link section). Any itch to patch or
-  wrap it is a product-repo change, never a factory-side one.
+  byte-identical on linux and windows (README's driver-link section).
+  On macOS the exe is re-signed in-leg (spec 31): post-sign bytes ≠
+  release bytes, so the provenance gate's byte anchor is POSIX+windows
+  only and the Mach-O arm anchors the SIGNED bytes + the signature
+  chain instead. Any itch to patch or wrap the exe beyond that is a
+  product-repo change, never a factory-side one.
+- The windows leg has **no preload shim** (the link-unit tarball
+  carries none): `LinkUnit#stage` is POSIX-only, and the windows env
+  image's layout card omits the `preload_shim` grant. windows signing
+  is the spec 34 follow-up, not this repo's current state.
 - `gh pr create` bodies: always `--body-file` — inline `--body` with
   backticks executes them (ecosystem §13).
 - Architecture/chain questions: `docs/build-chain.md` first, then

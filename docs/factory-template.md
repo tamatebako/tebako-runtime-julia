@@ -130,7 +130,13 @@ never a refetch-forever or a silent fallback:
    `libtfs_preload`). Repack arm consumes exactly one file from it —
    **`libtfs_preload.{so,dylib}`**, staged into the env image at
    `lib/tebako/` so the jail's host-IO binding survives the exec into
-   the interpreter (spec 22 §3 rules E2/E3).
+   the interpreter (spec 22 §3 rules E2/E3). **The repack arm's windows
+   legs stage nothing**: the windows link unit carries no preload shim
+   (its remaining contents are link-time inputs a repack factory never
+   touches), so the windows leg never downloads the unit and its layout
+   card omits the `preload_shim` grant — a declared-but-absent grant is
+   exit 78 at boot, and verified-but-unconsumed bytes are decorative
+   provenance (spec 00 §9).
 2. **The tfs CLI** (`tfs-<ver>-<pid>`) — verified against its published
    `.sha256` sidecar. Packs the env image (`tfs mkimage` with NO
    `--format` — limnifs is the default; a `--format` pin would drift
@@ -474,7 +480,18 @@ template instances (php = source-build, julia = repack).
   re-reads the image: `/__tpkg__/manifest.yaml` validates (no
   `manifest_error` from `tfs info --json`), `/lib/tebako/layout.yaml`
   is present, and every declared entrypoint exists (a broken pair fails
-  THIS leg, never a later publish).
+  THIS leg, never a later publish). **The macOS re-sign exception**:
+  when the repack arm's exe is re-signed in-leg (the spec 31 arm), the
+  shipped bytes legitimately differ from the card's recorded release
+  digest, so the byte anchor is POSIX+windows only. The Mach-O arm
+  instead anchors the exe `.sha256` sidecar to the SIGNED bytes (the
+  sign step rewrites the sidecar itself — sign-then-hash is mandatory)
+  and verifies the signature chain (`codesign --verify --strict`;
+  armed: the TeamIdentifier, the embedded entitlement pair, the
+  notarization ticket's visibility) — while the card keeps recording
+  the fetch-verified release digest as consumption provenance. Detect
+  the exe shape from its magic bytes (`od`/`head` — Git-bash carries
+  no `file`), never from the runner's uname.
 
 ### 3.10 Platform legs and the matrix
 
@@ -485,8 +502,25 @@ template instances (php = source-build, julia = repack).
   branch in `Platform`/`Mlibs`-class files. The windows leg needs the
   spec 17 §7 materialize tier (source-build arm) or rides the wrapper's
   spawn semantics (repack arm); macOS adds the sign+notarize arm
-  (spec 31, gated on `APPLE_SIGNING_ENABLED`) and the
-  `macos_deployment_target` pin.
+  (spec 31, gated on `APPLE_SIGNING_ENABLED`) and — on the SOURCE-BUILD
+  arm — the `macos_deployment_target` pin.
+- **Repack-arm macOS legs carry NO `macos_deployment_target`**: nothing
+  compiles, so a floor pin would be decorative (spec 00 §9) — the
+  launcher ships the product's own bytes, whose floor the product's
+  ship gate already owns.
+- **Repack-arm windows legs need no msys2 provisioning when upstream
+  ships tar.gz** (verify: zero symlinks inside): Git-bash's GNU tar
+  suffices, and the runner's hosted ruby + Git-bash run the stdlib-only
+  tooling (the openjdk factory's msys2 need was bsdtar-for-zip + the
+  gcc runtime — re-derive your own need, never inherit it). Two
+  windows-specific tool notes ride the smoke/gate: the exec cache keys
+  under the windows temp vars (`std::env::temp_dir` reads TMP/TEMP,
+  never TMPDIR — pin all three), and native tool invocations from
+  Git-bash want `MSYS2_ARG_CONV_EXCL='*'` for VFS-path arguments plus
+  `cygpath -m` for host paths (the openjdk idiom). The `--tebako-image`
+  triple survives windows drive letters by construction (the driver
+  splits on the last two colons — its own `windows_drive_colon_survives`
+  test).
 
 ## 4. The opening checklist
 

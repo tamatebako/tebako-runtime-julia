@@ -32,10 +32,12 @@ module TebakoJuliaBuilder
   # Assembles the env image's layout tree from the staged upstream tree
   # (TreeStager): the julia tree with the non-runtime surface pruned,
   # plus the tebako contract card (lib/tebako/layout.yaml — the spec-29
-  # declaration: interpreter + visibility), the preload shim (POSIX —
+  # declaration: interpreter + visibility), the preload shim (POSIX ONLY —
   # staged so the jail's host-IO binding survives the exec into the
-  # interpreter; a missing shim is a hard error, never a silent
-  # degrade), and the L1 payload manifest (__tpkg__/manifest.yaml).
+  # interpreter; a missing shim is a hard error, never a silent degrade;
+  # windows has no preload tier, so the windows image stages no shim and
+  # its layout card omits the grant — the openjdk factory's shape), and
+  # the L1 payload manifest (__tpkg__/manifest.yaml).
   #
   # Unlike the source-build arm, the interpreter binary itself STAYS in
   # the image — it is the image's whole point (the exe artifact beside
@@ -53,14 +55,17 @@ module TebakoJuliaBuilder
     # docs/spec/schemas/layout.yaml (snake_case): schema/version, era,
     # image_layout, mount_root, interpreter_api_version; the additive
     # spec-29 declarations (schema_minor 4) — interpreter (the in-image
-    # path the wrapper execs) and visibility ("exec-cache": julia
-    # self-locates its home relative to the exe path, the JVM's shape —
-    # the whole tree materializes and julia runs from host-real files);
-    # the additive preload_shim grant (schema_minor 2) names the staged
-    # shim's in-image path. mount_root_override stays UNGRANTED (the
-    # openjdk rationale: julia self-locates via the launcher path's
-    # bin/.. — nothing in it follows TEBAKO_MOUNT_ROOT, so the image
-    # grants no override; a granted no-op knob would violate spec 00 §9).
+    # path the wrapper execs; .exe on windows) and visibility
+    # ("exec-cache": julia self-locates its home relative to the exe
+    # path, the JVM's shape — the whole tree materializes and julia runs
+    # from host-real files); the additive preload_shim grant
+    # (schema_minor 2) names the staged shim's in-image path — POSIX
+    # only, omitted on windows (no preload tier there; a granted-but-
+    # absent shim would be exit 78 at boot). mount_root_override stays
+    # UNGRANTED (the openjdk rationale: julia self-locates via the
+    # launcher path's bin/.. — nothing in it follows TEBAKO_MOUNT_ROOT,
+    # so the image grants no override; a granted no-op knob would
+    # violate spec 00 §9).
     LAYOUT_DECLARATION = {
       "schema" => "layout",
       "schema_version" => 1,
@@ -69,6 +74,7 @@ module TebakoJuliaBuilder
     }.freeze
     LAYOUT_PATH = File.join("lib", "tebako", "layout.yaml").freeze
     INTERPRETER = "/bin/julia"
+    INTERPRETER_WINDOWS = "/bin/julia.exe"
 
     # Pruned under the staged tree (relative spellings): the class
     # comment's policy, exact per the upstream 1.13 tree.
@@ -98,7 +104,7 @@ module TebakoJuliaBuilder
       FileUtils.mkdir_p(dest)
       FileUtils.cp_r("#{staged_tree}/.", dest)
       prune(dest)
-      deploy_preload(dest)
+      deploy_preload(dest) if @platform.posix?
       deploy_layout(dest)
       deploy_manifest(dest)
       dest
@@ -139,10 +145,15 @@ module TebakoJuliaBuilder
       declaration = LAYOUT_DECLARATION.merge(
         "mount_root" => @platform.mount_root,
         "interpreter_api_version" => @julia.api_version,
-        "interpreter" => INTERPRETER,
-        "visibility" => "exec-cache",
-        "preload_shim" => File.join("lib", "tebako", @link_unit.preload_shim_name)
+        "interpreter" => @platform.msys? ? INTERPRETER_WINDOWS : INTERPRETER,
+        "visibility" => "exec-cache"
       )
+      # The preload grant exists only where the shim does (POSIX): a
+      # windows image declaring it would fail the boot's layout pair
+      # check (declared-but-absent is exit 78).
+      if @platform.posix?
+        declaration["preload_shim"] = File.join("lib", "tebako", @link_unit.preload_shim_name)
+      end
       File.write(path, YAML.dump(declaration))
       puts "   ... env image layout declaration: #{path}"
     end

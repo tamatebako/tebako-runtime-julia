@@ -30,7 +30,7 @@ require "fileutils"
 module TebakoJuliaBuilder
   # Packs the assembled layout tree into the standalone image published
   # next to the runtime executable:
-  # tebako-runtime-<tebako>-php-<php>-<platform>.tfs (the image name
+  # tebako-runtime-<tebako>-julia-<jv>-<platform>.tfs (the image name
   # derives from the executable's own name).
   #
   # One tool only: the pin-verified tfs CLI (TfsTool), `tfs mkimage`

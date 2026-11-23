@@ -29,20 +29,42 @@
 # compiles nothing, so its provenance is identity, not symbols. The
 # shadow class here is the QUIETLY DRIFTED CONSUMPTION — a launcher that
 # is not quite the pinned release's bytes, a dynamic closure that grew a
-# non-system library, an image that packs but cannot be read back. The
-# fingerprints:
+# non-system library, a signed macOS exe whose sidecar still anchors the
+# pre-sign bytes, an image that packs but cannot be read back. The
+# fingerprints, per exe kind (magic-sniffed — Git-bash carries no
+# `file`):
 #
-#   1. byte anchor: the exe's sha256 IS the pinned release's published
-#      launcher digest, recorded in the pair's own .contract.yaml
-#      (link_unit.launcher_sha256) — the consumed artifact flowed down
-#      unmodified. The exe's .sha256 sidecar must agree with both.
-#   2. the exe's runtime library closure is system-only (the audience
-#      rule in executable form — the readelf NEEDED allowlist;
+#   1. byte anchor (ELF + PE): the exe's sha256 IS the pinned release's
+#      published launcher digest, recorded in the pair's own
+#      .contract.yaml (link_unit.launcher_sha256) — the consumed
+#      artifact flowed down unmodified. The exe's .sha256 sidecar must
+#      agree with both. (PE imports are not separately audited: the
+#      byte anchor plus the product's own ship gate cover the closure,
+#      and windows Authenticode signing is the spec 34 follow-up, never
+#      this gate's concern.)
+#      Mach-O (sign-then-hash): the exe is signed IN-LEG after the build
+#      (ci/macos-sign-notarize-runtime.sh — spec 31 §5), so the shipped
+#      bytes legitimately differ from the card's recorded release digest
+#      (that record stays as consumption provenance). The anchors here
+#      are: the exe .sha256 sidecar agrees with the SIGNED bytes, and
+#      codesign verifies strict; when APPLE_SIGNING_ENABLED=true the
+#      gate additionally asserts the TeamIdentifier, the embedded
+#      entitlement pair, and the notarization ticket — and the unsigned
+#      (byte-identical) outcome is then a failure, because the armed
+#      sign step cannot silently no-op. Unsigned with
+#      APPLE_SIGNING_ENABLED unset stays first-class (spec 00 invariant
+#      7: byte-identical with the release's launcher, notice only).
+#   2. ELF only: the exe's runtime library closure is system-only (the
+#      audience rule in executable form — the readelf NEEDED allowlist;
 #      tebako-runtime-python#76 is the reference defect).
 #   3. image read-back: re-read the env image with the same tfs CLI that
 #      wrote it — the embedded tier-1 manifest exists and validates, the
 #      layout declaration is present, and the declared entrypoint exists
-#      (tebako-runtime-openjdk's read-back arm).
+#      (/bin/julia.exe on windows — tebako-runtime-openjdk's read-back
+#      arm, exe-suffixed).
+#
+# Env: APPLE_SIGNING_ENABLED / APPLE_TEAM_ID ride the Mach-O arm (the
+# workflow passes them; unset means the unsigned path's asserts only).
 #
 # Usage:
 #   ci/check_pair_provenance.sh --exe PATH --card PATH --tfs PATH --image PATH
@@ -67,7 +89,7 @@ done
 [ -n "$IMAGE" ] || { echo "check_pair_provenance: --image PATH is required" >&2; exit 2; }
 [ -s "$EXE" ] || { echo "::error::provenance: exe $EXE is missing or empty"; exit 1; }
 [ -s "$CARD" ] || { echo "::error::provenance: contract card $CARD is missing or empty"; exit 1; }
-[ -x "$TFS" ] || { echo "::error::provenance: tfs CLI $TFS is missing or not executable"; exit 1; }
+[ -s "$TFS" ] || { echo "::error::provenance: tfs CLI $TFS is missing or empty"; exit 1; }
 [ -s "$IMAGE" ] || { echo "::error::provenance: env image $IMAGE is missing or empty"; exit 1; }
 
 failures=0
@@ -76,36 +98,110 @@ note() { echo "provenance: $*"; }
 
 sha256_of() { { sha256sum "$1" 2>/dev/null || shasum -a 256 "$1"; } | cut -d' ' -f1; }
 
-# --- 1. the byte anchor --------------------------------------------------
+# The exe shape from its magic bytes (od + head are coreutils/BSD — no
+# `file` dependency, which Git-bash lacks). Mach-O covers the thin
+# little-endian forms the legs ship (arm64/x86_64) plus fat.
+exe_kind() {
+  local magic
+  magic="$(head -c 4 "$1" | od -An -tx1 | tr -d ' \n')"
+  case "$magic" in
+    7f454c46) echo elf ;;
+    cffaedfe | cefaedfe | cafebabe) echo macho ;;
+    4d5a*) echo pe ;;
+    *) echo unknown ;;
+  esac
+}
+
+KIND="$(exe_kind "$EXE")"
+ARMED="${APPLE_SIGNING_ENABLED:-false}"
+ENTRYPOINT="/bin/julia"
+[ "$KIND" = "pe" ] && ENTRYPOINT="/bin/julia.exe"
+note "exe kind: $KIND (entrypoint $ENTRYPOINT)"
+
+# --- 1. the byte anchor / the signed-bytes anchor ------------------------
 # YAML.dump renders the scalar as `launcher_sha256: <hex>` — sed-extract
 # the value (the card is this factory's own emission; a full YAML parse
 # would buy nothing here).
 want="$(sed -n 's/^  launcher_sha256: *//p' "$CARD" | tr -d '[:space:]')"
 case "$want" in
   '' | *[!0-9a-f]*)
-    fail "$CARD carries no parseable link_unit.launcher_sha256 — the byte anchor cannot be checked" ;;
+    fail "$CARD carries no parseable link_unit.launcher_sha256 — the consumption provenance cannot be checked" ;;
   *)
     got="$(sha256_of "$EXE")"
-    if [ "$got" = "$want" ]; then
-      note "the exe is byte-identical with the pinned release's published launcher ($want)"
-    else
-      fail "$EXE sha256 is $got but the card records $want — the shipped exe is NOT the pinned release's launcher (the consumption drifted)"
-    fi
-    # The sidecar is the store-layout trust anchor; it must agree with
-    # the bytes it sits next to.
     sidecar="$(cat "$EXE.sha256" 2>/dev/null || true)"
-    case "$sidecar" in
-      "$got  $(basename "$EXE")") note "the exe .sha256 sidecar agrees with the bytes" ;;
-      '') fail "$EXE.sha256 is missing — the store-shape trust anchor was not emitted" ;;
-      *) fail "$EXE.sha256 disagrees with the exe bytes (sidecar: $sidecar; actual: $got)" ;;
+    case "$KIND" in
+      elf | pe)
+        if [ "$got" = "$want" ]; then
+          note "the exe is byte-identical with the pinned release's published launcher ($want)"
+        else
+          fail "$EXE sha256 is $got but the card records $want — the shipped exe is NOT the pinned release's launcher (the consumption drifted)"
+        fi
+        # The sidecar is the store-layout trust anchor; it must agree
+        # with the bytes it sits next to.
+        case "$sidecar" in
+          "$got  $(basename "$EXE")") note "the exe .sha256 sidecar agrees with the bytes" ;;
+          '') fail "$EXE.sha256 is missing — the store-shape trust anchor was not emitted" ;;
+          *) fail "$EXE.sha256 disagrees with the exe bytes (sidecar: $sidecar; actual: $got)" ;;
+        esac
+        [ "$KIND" = "pe" ] && note "PE import closure: covered by the byte anchor + the product's ship gate (windows Authenticode signing is the spec 34 follow-up)"
+        ;;
+      macho)
+        if [ "$got" = "$want" ]; then
+          # The unsigned path: the product's own signed bytes flowed
+          # down untouched (spec 00 invariant 7's first-class unsigned).
+          if [ "$ARMED" = "true" ]; then
+            fail "APPLE_SIGNING_ENABLED=true yet the exe is byte-identical with the UNSIGNED release launcher — the armed sign step cannot no-op (ci/macos-sign-notarize-runtime.sh must run before this gate)"
+          else
+            note "the exe is byte-identical with the pinned release's published launcher (the unsigned path — spec 00 invariant 7)"
+          fi
+        else
+          # The signed path: sign-then-hash — the sidecar (rewritten by
+          # the sign step) anchors the SIGNED bytes; the card's record
+          # stays as consumption provenance.
+          [ "$ARMED" = "true" ] || fail "$EXE differs from the release's launcher digest yet APPLE_SIGNING_ENABLED is not true — an unexplained re-sign is a drifted consumption"
+          case "$sidecar" in
+            "$got  $(basename "$EXE")") note "the exe .sha256 sidecar agrees with the SIGNED bytes (sign-then-hash)" ;;
+            '') fail "$EXE.sha256 is missing — the sign step must rewrite it to the signed bytes" ;;
+            *) fail "$EXE.sha256 anchors the PRE-SIGN bytes (sidecar: $sidecar; actual: $got) — sign-then-hash is mandatory" ;;
+          esac
+        fi
+        if command -v codesign >/dev/null 2>&1; then
+          codesign --verify --strict "$EXE" 2>/dev/null \
+            && note "codesign --verify --strict passes" \
+            || fail "codesign --verify --strict rejects $EXE"
+          if [ "$ARMED" = "true" ]; then
+            TEAM_ID="${APPLE_TEAM_ID:-}"
+            [ -n "$TEAM_ID" ] || fail "APPLE_SIGNING_ENABLED=true but APPLE_TEAM_ID is unset — the TeamIdentifier assert cannot run"
+            if [ -n "$TEAM_ID" ]; then
+              codesign -dvv "$EXE" 2>&1 | grep -q "TeamIdentifier=$TEAM_ID" \
+                && note "TeamIdentifier=$TEAM_ID (the expected identity)" \
+                || fail "TeamIdentifier is not $TEAM_ID — signed by an unexpected identity"
+            fi
+            embedded="$(codesign -d --entitlements :- "$EXE" 2>/dev/null || true)"
+            trues="$(printf '%s' "$embedded" | grep -o '<true/>' | wc -l | tr -d ' ')"
+            [ "$trues" = "2" ] \
+              && note "the entitlement pair is embedded (disable-library-validation + allow-jit)" \
+              || fail "the entitlement pair is not embedded (got $trues <true/> values)"
+            codesign --verify --strict --check-notarization -R=notarized "$EXE" 2>/dev/null \
+              && note "the notarization ticket is visible to codesign" \
+              || fail "the notarization ticket is not visible — the sign step's notary arm did not complete"
+          fi
+        else
+          [ "$ARMED" = "true" ] && fail "APPLE_SIGNING_ENABLED=true on a host without codesign — the macOS signing asserts cannot run" \
+                                || note "no codesign on this host — the signature asserts are inapplicable"
+        fi
+        ;;
+      *)
+        fail "unrecognized exe shape ($KIND) — the provenance gate names every shape, never skips one"
+        ;;
     esac
     ;;
 esac
 
-# --- 2. the exe's runtime library closure is system-only -----------------
+# --- 2. ELF: the exe's runtime library closure is system-only ------------
 # capture-then-test everywhere (never readelf | grep -q under pipefail:
 # grep's early exit SIGPIPEs readelf into a false negative).
-if file_out="$(file "$EXE" 2>/dev/null)" && printf '%s' "$file_out" | grep -q ELF; then
+if [ "$KIND" = "elf" ]; then
   needed=""
   if command -v readelf >/dev/null 2>&1; then
     needed="$(readelf -d "$EXE" 2>/dev/null | awk '/NEEDED/ { gsub(/[][]/, ""); print $NF }' || true)"
@@ -129,28 +225,32 @@ if file_out="$(file "$EXE" 2>/dev/null)" && printf '%s' "$file_out" | grep -q EL
     esac
   done <<< "$needed"
   [ -n "$needed" ] && [ "$failures" -eq "$needed_failures_before" ] && note "the exe's NEEDED set is system-only: $(printf '%s\n' "$needed" | tr '\n' ' ')"
-else
-  note "$EXE is not ELF — the NEEDED audit is inapplicable on this platform"
 fi
 
 # --- 3. the image reads back ---------------------------------------------
 # A broken pair fails THIS leg, never a downstream consumer: the tfs CLI
 # that wrote the image re-reads it. The info surface runs the same tpkg
 # manifest model the resolvers parse — build-time parity, no YAML-parser
-# dependency.
-"$TFS" stat "$IMAGE" /__tpkg__/manifest.yaml >/dev/null || {
+# dependency. Path rules (windows leg): the native tfs takes the host
+# image path in native form (cygpath; inert on POSIX), while the VFS
+# paths must reach it verbatim — Git-bash/msys2 argument conversion
+# would otherwise rewrite them to host paths (MSYS2_ARG_CONV_EXCL, inert
+# on POSIX).
+native_path() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s' "$1"; fi; }
+IMAGE_NATIVE="$(native_path "$IMAGE")"
+MSYS2_ARG_CONV_EXCL='*' "$TFS" stat "$IMAGE_NATIVE" /__tpkg__/manifest.yaml >/dev/null || {
   fail "no /__tpkg__/manifest.yaml in $IMAGE"; }
-"$TFS" stat "$IMAGE" /lib/tebako/layout.yaml >/dev/null || {
+MSYS2_ARG_CONV_EXCL='*' "$TFS" stat "$IMAGE_NATIVE" /lib/tebako/layout.yaml >/dev/null || {
   fail "no /lib/tebako/layout.yaml in $IMAGE (the driver's layout grant is absent)"; }
-"$TFS" stat "$IMAGE" /bin/julia >/dev/null || {
-  fail "the declared entrypoint /bin/julia is missing from $IMAGE"; }
-info="$("$TFS" info --json "$IMAGE")" || fail "tfs info cannot read $IMAGE"
+MSYS2_ARG_CONV_EXCL='*' "$TFS" stat "$IMAGE_NATIVE" "$ENTRYPOINT" >/dev/null || {
+  fail "the declared entrypoint $ENTRYPOINT is missing from $IMAGE"; }
+info="$(MSYS2_ARG_CONV_EXCL='*' "$TFS" info --json "$IMAGE_NATIVE")" || fail "tfs info cannot read $IMAGE"
 case "$info" in
   *'"manifest_error"'*)
     printf '%s\n' "$info" | grep '"manifest_error"' >&2
     fail "the embedded manifest does not validate" ;;
 esac
-[ "$failures" -eq 0 ] && note "the env image reads back: manifest validates, layout card + /bin/julia present"
+[ "$failures" -eq 0 ] && note "the env image reads back: manifest validates, layout card + $ENTRYPOINT present"
 
 if [ "$failures" -gt 0 ]; then
   echo "::error::provenance: $failures check(s) failed"

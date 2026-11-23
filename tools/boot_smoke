@@ -29,8 +29,11 @@
 # Boot smoke for a built tebako julia runtime (the php factory's
 # boot_smoke role — stdlib-only, no rspec surface): boots the shipped
 # pair (the spec-29 launcher + its sibling env image) and asserts the
-# driver contract end to end. Scenarios (POSIX — the windows spawn
-# semantics arrive with the windows leg):
+# driver contract end to end. Platform notes: on windows the wrapper
+# SPAWNS the interpreter (spec 17 §7) and the exec cache keys under the
+# windows temp vars (Rust's std::env::temp_dir reads TMP/TEMP, never
+# TMPDIR), so run_scenarios pins all three; the scenario set is
+# identical on every leg. Scenarios:
 #
 #   bare                 no TEBAKO_RUNTIME_IMAGE: the wrapper names the
 #                        missing handoff on stderr and fails at exit 65
@@ -161,11 +164,16 @@ end
 
 def resolve_tfs(requested)
   candidate = requested || ENV.fetch("TEBAKO_TFS", nil) || "tfs"
-  return candidate if File.file?(candidate) && File.executable?(candidate)
+  # Native windows ruby resolves executables literally — the fetched CLI
+  # is tfs.exe, so the .exe spelling joins the probe set there.
+  spellings = BOOT_PLATFORM.msys? && File.extname(candidate).empty? ? [candidate, "#{candidate}.exe"] : [candidate]
+  spellings.each do |spelling|
+    return spelling if File.file?(spelling) && File.executable?(spelling)
 
-  ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).each do |dir|
-    path = File.join(dir, candidate)
-    return path if File.file?(path) && File.executable?(path)
+    ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).each do |dir|
+      path = File.join(dir, spelling)
+      return path if File.file?(path) && File.executable?(path)
+    end
   end
   usage_error("no tfs CLI resolvable (#{candidate}) — the fixture-image scenarios need it " \
               "(--tfs / TEBAKO_TFS; tools/build_runtime already fetched one under .build)")
@@ -259,11 +267,17 @@ def run_scenarios(executable, platform, selected, tfs:)
 
   Dir.mktmpdir("tebako-julia-smoke-fixtures") do |dir|
     # One exec-cache root for the whole run (spec 22 §6 keys the cache
-    # under TMPDIR — TEBAKO_EXEC_CACHE is the driver's export, never an
-    # input): the whole-tree materialization (~1 GB) then happens ONCE,
-    # not per scenario.
+    # under the process temp dir — TEBAKO_EXEC_CACHE is the driver's
+    # export, never an input): the whole-tree materialization (~1 GB)
+    # then happens ONCE, not per scenario. POSIX shells read TMPDIR;
+    # the windows driver is a native exe whose std::env::temp_dir reads
+    # TMP/TEMP (never TMPDIR), so all three pin the same native dir.
     ENV["TMPDIR"] = File.join(dir, "tmp")
     FileUtils.mkdir_p(ENV["TMPDIR"])
+    if platform.msys?
+      ENV["TEMP"] = ENV["TMPDIR"]
+      ENV["TMP"] = ENV["TMPDIR"]
+    end
 
     selected.each do |scenario|
       case scenario

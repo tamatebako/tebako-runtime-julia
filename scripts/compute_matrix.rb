@@ -53,10 +53,8 @@
 #                               grammar tebako-runtime-<ver>-julia-<jv>-<host_id>)
 #   container                 — the tpkg-builder image ref with
 #                               contract.yml's container_version tag
-#                               applied, null for runner-native legs (none
-#                               today — the skeleton's only leg is
-#                               containerized; a macos increment adds its
-#                               runner-native row to matrix.json)
+#                               applied, null for runner-native legs (the
+#                               macos/windows rows carry "container": null)
 #   link_unit_pid             — the product release's platform id for the
 #                               link-unit/launcher/tfs asset names
 #                               (Platform::LINK_UNIT_PIDS)
