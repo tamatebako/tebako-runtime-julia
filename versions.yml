@@ -1,0 +1,47 @@
+# Copyright (c) 2026 [Ribose Inc](https://www.ribose.com).
+# All rights reserved.
+# This file is a part of tamatebako
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS
+# BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+# Supported upstream julia versions. Julia ships OFFICIAL per-platform
+# prebuilt binaries (julialang.org), so this factory is a REPACK (the
+# template's §1 repack arm — no compilation anywhere): THIS file is the
+# source-pin trust anchor, keyed per version and per spec 03 §3 triplet,
+# the sha256 recorded beside each url, verified at fetch time (a mismatch
+# is a hard error, never a refetch). The pins are upstream's own published
+# values — cross-checked against https://julialang-s3.julialang.org/bin/
+# versions.json on 2026-11-23 (1.13.4 is the current stable).
+#
+# contract.yml's julia.catalog selects which of these pinned versions the
+# matrix builds; scripts/check_contract.rb locks the two (a catalog
+# version with no pin, or a pin the catalog never builds, is a config
+# bug). A new triplet's increment adds its sources entry here in the same
+# PR as the matrix row.
+---
+versions:
+  "1.13.4":
+    line: "1.13"
+    sources:
+      x86_64-linux-gnu:
+        url: https://julialang-s3.julialang.org/bin/linux/x64/1.13/julia-1.13.4-linux-x86_64.tar.gz
+        sha256: cf1658f13b91facccd57d41464d7125a0e48a1d24f49062d71532d04d4ec4130

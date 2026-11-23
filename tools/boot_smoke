@@ -1,0 +1,381 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Copyright (c) 2026 [Ribose Inc](https://www.ribose.com).
+# All rights reserved.
+# This file is a part of tamatebako
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS
+# BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+# Boot smoke for a built tebako julia runtime (the php factory's
+# boot_smoke role — stdlib-only, no rspec surface): boots the shipped
+# pair (the spec-29 launcher + its sibling env image) and asserts the
+# driver contract end to end. Scenarios (POSIX — the windows spawn
+# semantics arrive with the windows leg):
+#
+#   bare                 no TEBAKO_RUNTIME_IMAGE: the wrapper names the
+#                        missing handoff on stderr and fails at exit 65
+#                        (its interpreter lives in the env image — no
+#                        honest bare boot exists, unlike the php arm's
+#                        static exe)
+#   boot                 the pair handoff: --tebako-entry julia
+#                        --version answers off the pair (the bare-name
+#                        runtime-entrypoint form — the env image's own
+#                        provides.entrypoints declaration)
+#   boot-tree            the exec-cache home carries the image: julia
+#                        sees the layout card and its stdlib inside its
+#                        materialized home (proof the whole-tree
+#                        materialization served the mount's bytes)
+#   payload              --tebako-image <fixture>:-:/app +
+#                        --tebako-entry /hello.jl: a script executes
+#                        from the mounted payload (under exec-cache the
+#                        entry is bridged to its host twin — the assert
+#                        is the script's OUTPUT, never its path)
+#   compute-floor        the boot probes are blind to a wedged leg
+#                        (tebako-runtime-python#79's lesson class): a
+#                        fixed pure-compute loop (fib(35), no I/O in the
+#                        loop) timed INSIDE the interpreter (@elapsed,
+#                        best of three after a JIT warm-up — boot and
+#                        materialization cost are excluded) lands under
+#                        a generous ceiling. The ceiling is a regression
+#                        tripwire, never a benchmark. NO flags arm: the
+#                        bytes are upstream's prebuilt official binaries
+#                        (the .contract.yaml records the archive, no
+#                        CFLAGS — the mis-flagged-build class belongs to
+#                        the source-build arm). Mode is fixed to
+#                        fail-closed (no live slow-compute defect rides
+#                        this factory's pinned launcher line; the warn
+#                        tier lands only if one appears).
+#   bad-mount            --tebako-image <missing>:-:/nope -> exit 69
+#                        (the unavailable image, named on stderr)
+#   mount-root-malformed TEBAKO_MOUNT_ROOT=relative/path -> exit 65
+#                        (driver-validated pre-mount)
+#   override-ungranted   TEBAKO_MOUNT_ROOT=<abs> against the pair's env
+#                        image -> exit 78: the layout omits the grant
+#                        (julia self-locates via the exe path — nothing
+#                        follows the override; the granted-boot scenario
+#                        exists only on runtimes that grant it)
+#
+# Usage:
+#   tools/boot_smoke [--runtime-root DIR | --exe PATH] [--tfs PATH]
+#                    [--scenario all|bare|boot|boot-tree|payload|
+#                                compute-floor|bad-mount|
+#                                mount-root-malformed|override-ungranted]
+#
+# Exit codes: 0 green · 141 usage/resolution · 143 a scenario failed.
+
+require "fileutils"
+require "open3"
+require "optparse"
+require "tmpdir"
+
+REPO_ROOT = File.expand_path("..", __dir__).freeze
+$LOAD_PATH.unshift(File.join(REPO_ROOT, "build", "lib"))
+
+require "tebako_julia_builder"
+
+# Per-boot wall clock. Generous: the first exec-cache boot materializes
+# the whole julia home tree (~1 GB), and emulation legs multiply every
+# cost — a harness bound, never the contract's.
+BOOT_TIMEOUT = 180
+# The compute-floor scenario (the header block): fib(COMPUTE_FIB_N)
+# inner-timed, best of COMPUTE_FIB_RUNS after a warm-up call. The
+# ceiling carries order-of-magnitude headroom over a healthy leg (a
+# native x86_64 leg measures ~0.5 s; emulation and wedged-cache classes
+# land far under this) — a tripwire, never a benchmark bound.
+COMPUTE_FIB_N = 35
+COMPUTE_FIB_RUNS = 3
+COMPUTE_FLOOR_SECONDS = 20.0
+IMAGE_SUFFIXES = %w[.tfs .dwarfs].freeze
+MARKER_SUFFIXES = %w[.sha256 .origin .yaml].freeze
+NON_EXECUTABLE_SUFFIXES = (IMAGE_SUFFIXES + MARKER_SUFFIXES).freeze
+
+# The child env is REPLACED, not inherited: any tebako/preload leftovers
+# a host setup would leak in are scrubbed (the ruby factory's msys
+# GEM_HOME lesson), and host julia configuration (JULIA_DEPOT_PATH,
+# JULIA_PROJECT, …) never reaches the pair either.
+ENV_SCRUBBED = %w[LD_PRELOAD DYLD_INSERT_LIBRARIES DYLD_FALLBACK_LIBRARY_PATH].freeze
+
+# The host platform, probed once.
+BOOT_PLATFORM = TebakoJuliaBuilder::Platform.new
+
+def usage_error(message)
+  warn "boot_smoke: #{message}"
+  exit 141
+end
+
+options = { runtime_root: ENV.fetch("TEBAKO_RUNTIME_ROOT", nil), exe: nil, tfs: nil, scenario: "all" }
+parser = OptionParser.new do |opts|
+  opts.banner = "Usage: tools/boot_smoke [options]"
+  opts.on("--runtime-root DIR", "Directory holding exactly one tebako-runtime-* executable") do |v|
+    options[:runtime_root] = v
+  end
+  opts.on("--exe PATH", "The runtime executable itself (wins over --runtime-root)") { |v| options[:exe] = v }
+  opts.on("--tfs PATH", "tfs CLI for the fixture images (default: TEBAKO_TFS, then tfs on PATH)") do |v|
+    options[:tfs] = v
+  end
+  opts.on("--scenario NAME", "One scenario to run (default: all)") { |v| options[:scenario] = v }
+  opts.on("-h", "--help", "Print this help") do
+    puts opts
+    exit 0
+  end
+end
+parser.parse!
+
+platform = BOOT_PLATFORM
+
+# --- artifact resolution ---------------------------------------------------
+
+def resolve_executable(root, exe)
+  return File.expand_path(exe) if exe && File.file?(exe)
+  usage_error("--exe #{exe.inspect} is not a file") if exe
+  usage_error("no --runtime-root/--exe (TEBAKO_RUNTIME_ROOT unset)") if root.to_s.empty? || !File.exist?(root)
+  return File.expand_path(root) if File.file?(root)
+
+  candidates = Dir.glob(File.join(root, "tebako-runtime-*"))
+                  .select { |path| File.file?(path) && !NON_EXECUTABLE_SUFFIXES.include?(File.extname(path)) }
+  usage_error("no tebako runtime executable under #{root}") if candidates.empty?
+  usage_error("several runtime executables under #{root} (#{candidates.join(", ")})") if candidates.length > 1
+
+  File.expand_path(candidates.first)
+end
+
+def resolve_tfs(requested)
+  candidate = requested || ENV.fetch("TEBAKO_TFS", nil) || "tfs"
+  return candidate if File.file?(candidate) && File.executable?(candidate)
+
+  ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).each do |dir|
+    path = File.join(dir, candidate)
+    return path if File.file?(path) && File.executable?(path)
+  end
+  usage_error("no tfs CLI resolvable (#{candidate}) — the fixture-image scenarios need it " \
+              "(--tfs / TEBAKO_TFS; tools/build_runtime already fetched one under .build)")
+end
+
+# --- scenario drivers ------------------------------------------------------
+
+def boot(executable, argv, env_extra, timeout: BOOT_TIMEOUT)
+  Dir.mktmpdir("tebako-julia-boot-smoke") do |cwd|
+    env = ENV_SCRUBBED.to_h { |key| [key, nil] }
+    ENV.each_key { |key| env[key] = nil if key.start_with?("TEBAKO_", "JULIA_") }
+    env.merge!(env_extra)
+    # popen3 + a wait-deadline poll, NOT Timeout.timeout around capture3:
+    # the Timeout unwind lands in popen3's ensure (wait_thr.join on the
+    # still-immortal child) and blocks forever there, so the timeout
+    # could never fire on a wedged runtime (the tebako#527 gnu shape:
+    # zero output, never exits). Past the deadline the child is
+    # hard-killed and reaped BEFORE any unwind touches popen3's ensure.
+    out = err = status = nil
+    Open3.popen3(env, executable, *argv, chdir: cwd) do |stdin, stdout, stderr, wait_thr|
+      stdin.close
+      readers = [stdout, stderr].map { |io| Thread.new { io.read } }
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+      loop do
+        break if wait_thr.join(0.1)
+        next unless Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+        Process.kill("KILL", wait_thr.pid)
+        wait_thr.join
+        readers.each(&:kill)
+        return ["", "boot_smoke: runtime did not exit within #{timeout}s (hard-killed)", nil]
+      end
+      out, err = readers.map(&:value)
+      status = wait_thr.value
+    end
+    [out, err, status]
+  end
+end
+
+$failures = 0
+def check(name, ok, detail)
+  if ok
+    puts "ok   #{name}"
+  else
+    puts "FAIL #{name}: #{detail}"
+    $failures += 1
+  end
+end
+
+def expect_exit(name, out, err, status, code)
+  check(name, status&.exitstatus == code,
+        "expected exit #{code}, got #{status&.exitstatus.inspect}\nstdout: #{out}\nstderr: #{err}")
+end
+
+def expect_ok(name, out, err, status, marker)
+  ok = status&.exitstatus&.zero? && out.include?(marker)
+  check(name, ok, "expected exit 0 + #{marker.inspect}\nstdout: #{out}\nstderr: #{err}")
+end
+
+# The payload fixture: a script riding /app that reports the julia it
+# runs on (VERSION — proof the mounted entry executed under the pair).
+def payload_fixture(tfs, dir)
+  tree = File.join(dir, "payload-tree")
+  FileUtils.mkdir_p(tree)
+  File.write(File.join(tree, "hello.jl"), <<~JL)
+    println("PAYLOAD-OK")
+    println("julia: ", VERSION)
+  JL
+  image = File.join(dir, "payload.tfs")
+  out, st = Open3.capture2e(tfs, "mkimage", tree, "-o", image)
+  usage_error("fixture image build failed: #{out}") unless st.exitstatus&.zero? && File.file?(image)
+
+  image
+end
+
+KNOWN_SCENARIOS = %w[bare boot boot-tree payload compute-floor bad-mount
+                     mount-root-malformed override-ungranted].freeze
+# Scenarios that build images with the tfs CLI.
+TFS_SCENARIOS = %w[payload].freeze
+
+def selected_scenarios(only)
+  return KNOWN_SCENARIOS.dup if only == "all"
+  return [only] if KNOWN_SCENARIOS.include?(only)
+
+  usage_error("unknown scenario '#{only}' (known: #{KNOWN_SCENARIOS.join(", ")})")
+end
+
+def run_scenarios(executable, platform, selected, tfs:)
+  image = "#{executable.sub(/\.exe\z/, "")}.tfs"
+  mount_root = platform.mount_root
+
+  Dir.mktmpdir("tebako-julia-smoke-fixtures") do |dir|
+    # One exec-cache root for the whole run (spec 22 §6 keys the cache
+    # under TMPDIR — TEBAKO_EXEC_CACHE is the driver's export, never an
+    # input): the whole-tree materialization (~1 GB) then happens ONCE,
+    # not per scenario.
+    ENV["TMPDIR"] = File.join(dir, "tmp")
+    FileUtils.mkdir_p(ENV["TMPDIR"])
+
+    selected.each do |scenario|
+      case scenario
+      when "bare"
+        # The wrapper's honest bare boot (the header block): no env
+        # image, no interpreter — the tail names the missing handoff
+        # and fails 65 (the driver's own stderr note rides along).
+        out, err, st = boot(executable, ["--version"], {})
+        expect_exit("bare: no env image is the named 65, not a boot", out, err, st, 65)
+        check("bare: the missing handoff is named",
+              err.include?("TEBAKO_RUNTIME_IMAGE"), "stderr: #{err}")
+      when "boot"
+        unless File.file?(image)
+          check("boot", false, "no sibling env image #{image}")
+          next
+        end
+        out, err, st = boot(executable, ["--tebako-entry", "julia", "--version"],
+                            { "TEBAKO_RUNTIME_IMAGE" => image })
+        expect_ok("boot: julia --version answers off the pair", out, err, st, "julia version 1.13")
+      when "boot-tree"
+        # The exec-cache home carries the image (the header block):
+        # Sys.BINDIR resolves inside the materialized tree, so the
+        # layout card and the stdlib must read beside it — bytes that
+        # exist only in the image.
+        probe = <<~JL
+          home = joinpath(Sys.BINDIR, "..")
+          println("BOOT-TREE")
+          println(isfile(joinpath(home, "lib", "tebako", "layout.yaml")) ? "LAYOUT-OK" : "LAYOUT-MISS")
+          println(isdir(Sys.STDLIB) ? "STDLIB-OK" : "STDLIB-MISS")
+        JL
+        out, err, st = boot(executable, ["--tebako-entry", "julia", "-e", probe],
+                            { "TEBAKO_RUNTIME_IMAGE" => image })
+        expect_ok("boot-tree: the interpreter boots against its home", out, err, st, "BOOT-TREE")
+        check("boot-tree: the layout card rides the materialized home", out.include?("LAYOUT-OK"),
+              "stdout: #{out}\nstderr: #{err}")
+        check("boot-tree: the stdlib resolves inside the materialized home", out.include?("STDLIB-OK"),
+              "stdout: #{out}\nstderr: #{err}")
+      when "payload"
+        fixture = payload_fixture(tfs, dir)
+        out, err, st = boot(executable,
+                            ["--tebako-image", "#{fixture}:-:/app", "--tebako-entry", "/hello.jl"],
+                            { "TEBAKO_RUNTIME_IMAGE" => image })
+        expect_ok("payload", out, err, st, "PAYLOAD-OK")
+        check("payload: runs on the pair's julia", out.include?("julia: 1.13"),
+              "stdout: #{out}\nstderr: #{err}")
+      when "compute-floor"
+        unless File.file?(image)
+          check("compute-floor", false, "no sibling env image #{image}")
+          next
+        end
+        # The timing arm (the header block): fib(35) — no I/O in the
+        # loop — timed INSIDE the interpreter (@elapsed around each run;
+        # the warm-up call absorbs the JIT), best-of-N drops one-off
+        # scheduling noise. Boot/materialization cost never enters the
+        # measurement.
+        compute_probe = <<~JL
+          fib(n) = n < 2 ? n : fib(n - 1) + fib(n - 2)
+          fib(10)
+          runs = [(@elapsed fib(#{COMPUTE_FIB_N})) for _ in 1:#{COMPUTE_FIB_RUNS}]
+          println("COMPUTE-FLOOR")
+          println("runs: ", join(round.(runs; digits = 3), " "))
+          println("best: ", round(minimum(runs); digits = 3))
+        JL
+        out, err, st = boot(executable, ["--tebako-entry", "julia", "-e", compute_probe],
+                            { "TEBAKO_RUNTIME_IMAGE" => image })
+        expect_ok("compute-floor", out, err, st, "COMPUTE-FLOOR")
+        out = out.delete("\r")
+        puts "     compute-floor: fib(#{COMPUTE_FIB_N}) #{out[/^runs: (.+)$/, 1]}"
+        best = out[/^best: (\d+(?:\.\d+)?)$/, 1]&.to_f
+        check("compute-floor: fib(#{COMPUTE_FIB_N}) best-of-#{COMPUTE_FIB_RUNS} under #{COMPUTE_FLOOR_SECONDS}s",
+              !best.nil? && best <= COMPUTE_FLOOR_SECONDS,
+              "measured best #{best.inspect}s (runs in the log above) — a leg computing at a fraction " \
+              "of the matrix's rate is a wedged artifact, never a publishable one " \
+              "(tebako-runtime-python#79's lesson class)\nstdout: #{out}\nstderr: #{err}")
+      when "bad-mount"
+        missing = File.join(dir, "no-such-image.tfs")
+        out, err, st = boot(executable,
+                            ["--tebako-image", "#{missing}:-:/nope", "--tebako-entry", "/nope/x.jl"],
+                            { "TEBAKO_RUNTIME_IMAGE" => image })
+        expect_exit("bad-mount", out, err, st, 69)
+        check("bad-mount: the image is named", err.include?(missing), "stderr: #{err}")
+      when "mount-root-malformed"
+        out, err, st = boot(executable, ["--tebako-entry", "julia", "--version"],
+                            { "TEBAKO_RUNTIME_IMAGE" => image, "TEBAKO_MOUNT_ROOT" => "relative/path" })
+        expect_exit("mount-root-malformed", out, err, st, 65)
+        check("mount-root-malformed: the variable is named", err.include?("TEBAKO_MOUNT_ROOT"), "stderr: #{err}")
+      when "override-ungranted"
+        # The pair's layout omits the mount_root_override grant (julia
+        # self-locates via the exe path), so ANY override is the named
+        # 78 — the ungranted class needs no fixture here (the php
+        # factory's granted boot has no julia counterpart).
+        out, err, st = boot(executable, ["--tebako-entry", "julia", "--version"],
+                            { "TEBAKO_RUNTIME_IMAGE" => image,
+                              "TEBAKO_MOUNT_ROOT" => File.join(dir, "elsewhere") })
+        expect_exit("override-ungranted", out, err, st, 78)
+        check("override-ungranted: the refusal names the root or the grant",
+              err.include?("TEBAKO_MOUNT_ROOT") || err.include?("mount_root_override") || err.include?(mount_root),
+              "stderr: #{err}")
+      end
+    end
+  end
+end
+
+executable = resolve_executable(options[:runtime_root], options[:exe])
+puts "-- Boot smoke: #{executable} (#{platform.host_id})"
+selected = selected_scenarios(options[:scenario])
+tfs = (selected & TFS_SCENARIOS).any? ? resolve_tfs(options[:tfs]) : nil
+run_scenarios(executable, platform, selected, tfs: tfs)
+
+if $failures.positive?
+  puts "#{$failures} scenario check(s) failed"
+  exit 143
+end
+puts "boot smoke: all green"
+exit 0

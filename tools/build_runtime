@@ -1,0 +1,145 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Copyright (c) 2026 [Ribose Inc](https://www.ribose.com).
+# All rights reserved.
+# This file is a part of tamatebako
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS
+# BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+# Build a tebako julia runtime package from the OFFICIAL PREBUILT julia
+# binary published by julialang.org (julia-<version>-<platform>.tar.gz,
+# sha256-verified against versions.yml's pins), with the driver riding
+# the pair as the spec-29 WRAPPER (the exe artifact is the product's
+# tebako-runtime-launcher — README's driver-link decision; the repack
+# arm of docs/factory-template.md §1: no compilation anywhere in this
+# factory). The julia analog of tebako-runtime-php's
+# tools/build_runtime; the orchestration model is its build/lib port.
+#
+# The phases:
+#   1. fetch + verify    the julia archive (SourceFetcher —
+#                        versions.yml's sha256 pins are the trust
+#                        anchor, per version per triplet)
+#   2. product assets    download + verify link-unit-<ver>-<pid>.tar.gz
+#                        (release-API digest anchor; LinkUnit — for
+#                        libtfs_preload), tebako-runtime-launcher
+#                        (published .sha256 sidecar; Launcher — the
+#                        pair's exe), and the tfs CLI (published .sha256
+#                        sidecar; TfsTool), all off contract.yml's
+#                        link_unit_release pin
+#   3. stage             the pristine julia tree (TreeStager: strip the
+#                        nesting dir, dereference in-tree symlinks,
+#                        assert the declared interpreter)
+#   4. env image         the pruned tree + the preload shim + the
+#                        layout card (interpreter / visibility:
+#                        exec-cache / preload_shim) + the L1 manifest,
+#                        packed by `tfs mkimage` (the default limnifs
+#                        writer)
+#   5. package           runtime-packages/tebako-runtime-<tebako>-julia-
+#                        <jv>-<triplet> (the launcher, byte-identical)
+#                        + .tfs + sidecars (.sha256 for both artifacts,
+#                        .contract.yaml)
+#   6. gates             ci/check_pair_provenance.sh + tools/boot_smoke
+#                        (separate entries — CI runs them as own steps)
+#
+# Exit codes (named, never silent): 64 usage · 109 version grammar · 112
+# platform/link input · 121/122 source fetch (sha mismatch / download)
+# · 123 link-unit miss/download · 124 link-unit sha mismatch/incomplete
+# · 125 tfs CLI fetch/verify · 126 launcher fetch/verify · 131 image
+# assemble/pack · 141/143 boot smoke (tools/boot_smoke).
+#
+# Usage:
+#   tools/build_runtime --julia 1.13.4 [--output PATH] [--prefix DIR]
+#                       [--tebako-version X.Y.Z] [--src-mirror URL]
+#                       [--link-unit-release TAG] [--link-unit-pid PID]
+#                       [--arch ARCH]
+
+require "optparse"
+
+REPO_ROOT = File.expand_path("..", __dir__).freeze
+$LOAD_PATH.unshift(File.join(REPO_ROOT, "build", "lib"))
+
+require "tebako_julia_builder"
+
+options = {
+  julia: nil,
+  output: nil,
+  prefix: File.join(REPO_ROOT, ".build"),
+  tebako_version: nil,
+  src_mirror: nil,
+  link_unit_release: nil,
+  link_unit_pid: nil,
+  arch: nil
+}
+
+parser = OptionParser.new do |opts|
+  opts.banner = "Usage: tools/build_runtime [options]"
+  opts.on("--julia VERSION", "julia version to build (e.g. 1.13.4), required") { |v| options[:julia] = v }
+  opts.on("-o", "--output PATH", "Output runtime package path " \
+                                 "(default: runtime-packages/tebako-runtime-<tebako>-julia-<jv>-<triplet>)") do |v|
+    options[:output] = v
+  end
+  opts.on("-p", "--prefix DIR", "Build prefix holding deps and the build trees (default: #{options[:prefix]})") { |v| options[:prefix] = v }
+  opts.on("--tebako-version VERSION", "Runtime package version (default: the VERSION file)") { |v| options[:tebako_version] = v }
+  opts.on("--src-mirror URL", "Base URL override for the source assets (file:// URLs work)") do |v|
+    options[:src_mirror] = v
+  end
+  opts.on("--link-unit-release TAG", "tamatebako/tebako release tag for the link unit + launcher + tfs CLI " \
+                                     "(default: contract.yml's link_unit_release)") do |v|
+    options[:link_unit_release] = v
+  end
+  opts.on("--link-unit-pid PID", "The product release's platform id for the link-unit asset " \
+                                 "(default: the detected host's)") { |v| options[:link_unit_pid] = v }
+  opts.on("--arch ARCH", "The leg's declared target arch (x86_64 | arm64) — pass it on emulated " \
+                         "tooling; default: the tooling process's self-report") { |v| options[:arch] = v }
+  opts.on("-h", "--help", "Print this help") do
+    puts opts
+    exit 0
+  end
+end
+parser.parse!
+
+begin
+  if options[:julia].nil?
+    puts "Missing required option: --julia VERSION"
+    puts parser
+    exit 64
+  end
+
+  tebako_version = options[:tebako_version] || File.read(File.join(REPO_ROOT, "VERSION")).strip
+  builder = TebakoJuliaBuilder::Builder.new(
+    repo_root: REPO_ROOT,
+    julia_version: options[:julia],
+    tebako_version: tebako_version,
+    prefix: options[:prefix],
+    output: options[:output],
+    src_mirror: options[:src_mirror],
+    link_unit_release: options[:link_unit_release],
+    link_unit_pid: options[:link_unit_pid],
+    arch: options[:arch]
+  )
+  builder.run
+rescue TebakoJuliaBuilder::Error => e
+  puts "build_runtime failed: #{e.message} [#{e.error_code}]"
+  exit(e.error_code)
+end
+exit(0)
