@@ -265,7 +265,17 @@ def run_scenarios(executable, platform, selected, tfs:)
   image = "#{executable.sub(/\.exe\z/, "")}.tfs"
   mount_root = platform.mount_root
 
-  Dir.mktmpdir("tebako-julia-smoke-fixtures") do |dir|
+  # windows MAX_PATH (260) is a real ceiling here: the driver layers
+  # ~85 chars of exec-cache hash directories under the temp root, and
+  # julia's stdlib test trees reach ~100 chars below tebako-home-0 —
+  # rooted at the profile temp the sum overflows ruby's own delete
+  # traversal (ENAMETOOLONG in mktmpdir's cleanup). A short base (the
+  # hosted runner's D:\a\_temp) plus a short prefix keeps the deepest
+  # materialized path comfortably under the ceiling; POSIX never nears
+  # it and keeps the descriptive name.
+  fixture_base = platform.msys? && ENV["RUNNER_TEMP"].to_s != "" ? ENV["RUNNER_TEMP"] : Dir.tmpdir
+  fixture_prefix = platform.msys? ? "tjs" : "tebako-julia-smoke-fixtures"
+  Dir.mktmpdir(fixture_prefix, fixture_base) do |dir|
     # One exec-cache root for the whole run (spec 22 §6 keys the cache
     # under the process temp dir — TEBAKO_EXEC_CACHE is the driver's
     # export, never an input): the whole-tree materialization (~1 GB)

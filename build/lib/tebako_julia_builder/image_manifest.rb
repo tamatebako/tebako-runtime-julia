@@ -155,8 +155,14 @@ module TebakoJuliaBuilder
         },
         "built_from" => { "src_sha256" => @src_sha256,
                           "patch_set" => "none (official julialang.org prebuilt, versions.yml pin)" },
+        # The bare-name runtime entrypoint the driver resolves VERBATIM
+        # against the mount root — the windows in-image file is
+        # bin/julia.exe, and the POSIX spelling there boots as "the env
+        # image's declaration lies". The ImageBuilder constants are the
+        # single owner (the layout card's interpreter field flows them).
         "entrypoints" => [
-          { "name" => "julia", "path" => "/bin/julia" }
+          { "name" => "julia",
+            "path" => @platform.msys? ? ImageBuilder::INTERPRETER_WINDOWS : ImageBuilder::INTERPRETER }
         ],
         "capabilities" => { "exec" => true, "read" => true, "runtime" => true }
       }
