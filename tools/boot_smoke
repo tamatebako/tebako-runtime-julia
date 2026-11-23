@@ -378,10 +378,16 @@ def run_scenarios(executable, platform, selected, tfs:)
         # The pair's layout omits the mount_root_override grant (julia
         # self-locates via the exe path), so ANY override is the named
         # 78 — the ungranted class needs no fixture here (the php
-        # factory's granted boot has no julia counterpart).
+        # factory's granted boot has no julia counterpart). The value
+        # must be WELL-FORMED for the platform or the refusal is the
+        # malformed class (65), never the grant's: native windows ruby
+        # joins with backslashes while the driver's grammar wants the
+        # drive-letter forward-slash shape (A:/t).
+        override = File.join(dir, "elsewhere")
+        override = override.tr("\\", "/") if platform.msys?
         out, err, st = boot(executable, ["--tebako-entry", "julia", "--version"],
                             { "TEBAKO_RUNTIME_IMAGE" => image,
-                              "TEBAKO_MOUNT_ROOT" => File.join(dir, "elsewhere") })
+                              "TEBAKO_MOUNT_ROOT" => override })
         expect_exit("override-ungranted", out, err, st, 78)
         check("override-ungranted: the refusal names the root or the grant",
               err.include?("TEBAKO_MOUNT_ROOT") || err.include?("mount_root_override") || err.include?(mount_root),
