@@ -66,9 +66,13 @@ module TebakoJuliaBuilder
       FileUtils.mkdir_p(dest)
       # The archive nests julia-<version>/; strip it (the recipe's
       # strip_components=1 — the openjdk factory's repack shape).
-      TebakoJuliaBuilder::BuildHelpers.run_with_capture(
-        ["tar", "-xzf", @tarball, "-C", dest, "--strip-components=1"]
-      )
+      # --force-local: on windows the tarball path carries a drive-letter
+      # colon, which GNU tar otherwise parses as an rsh host:path pair
+      # ("Cannot connect to D: resolve failed"). bsdtar (macOS) rejects
+      # the flag, so it rides only where the hazard lives.
+      extract = ["tar", "-xzf", @tarball, "-C", dest, "--strip-components=1"]
+      extract << "--force-local" if @platform.msys?
+      TebakoJuliaBuilder::BuildHelpers.run_with_capture(extract)
       assert_interpreter!(dest)
       dereference_symlinks!(dest)
       File.write(marker, "#{@src_sha256}\n")
