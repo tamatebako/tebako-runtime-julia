@@ -489,7 +489,13 @@ template instances (php = source-build, julia = repack).
   and verifies the signature chain (`codesign --verify --strict`;
   armed: the TeamIdentifier, the embedded entitlement pair, the
   notarization ticket's visibility) — while the card keeps recording
-  the fetch-verified release digest as consumption provenance. Detect
+  the fetch-verified release digest as consumption provenance. **The
+  windows re-sign exception** is the same shape under spec 34: when
+  the factory arms the Azure Trusted Signing lane
+  (`WINDOWS_SIGNING_ENABLED`), the PE arm of the gate anchors the
+  sidecar to the SIGNED bytes (the verify step re-anchors it —
+  sign-then-hash) plus a Valid timestamped Authenticode signature;
+  gate-off, the byte anchor holds byte-identical. Detect
   the exe shape from its magic bytes (`od`/`head` — Git-bash carries
   no `file`), never from the runner's uname.
 

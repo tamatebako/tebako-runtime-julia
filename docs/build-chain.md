@@ -88,10 +88,31 @@ fast named failure. Only the LAUNCHER is signed — the interpreter
 inside the env image keeps upstream's own Developer ID signature
 byte-identical (the repack arm never re-signs upstream bytes; upstream
 julia ships hardened-runtime with its own JIT/injection grants, which
-govern the materialized interpreter process post-exec). windows
-Authenticode signing is the spec 34 increment — NOT this stage: the
-windows exe ships the release's bytes byte-identical and the byte
-anchor holds there.
+govern the materialized interpreter process post-exec).
+
+The **windows Authenticode arm** (spec 34 §8.2 —
+`ci/windows-sign-gate.sh` + the in-leg sign block) runs in-leg at the
+same point, between the build and the gates. The arm check gates on
+the `WINDOWS_SIGNING_ENABLED` repo variable: anything else ships
+unsigned BY DESIGN (spec 00 invariant 7, a loud notice — the byte
+anchor holds byte-identical); armed + a missing `AZURE_*`
+secret/variable is a fast named failure before any signing call. When
+armed, the leg's ONE shippable PE — the launcher exe (julia.exe and
+its DLLs live inside the env image, the exec-cache shape, so there is
+no DLL facet) — stages under `sign-staging/` (the signing action
+enumerates by extension, so the `.tfs`, the card, and the sidecars
+never enter `files-folder`), `azure/login` OIDCs into the
+`windows-signing` environment (the job-level `id-token: write`
+boundary; the environment carries no protection rules — reviewers
+there would gate every platform's legs), the
+`Azure/artifact-signing-action` signs with the mandatory RFC 3161
+timestamp, and the pwsh verify step moves the signed bytes BACK over
+the contract path, runs `signtool verify /pa /v` +
+`Get-AuthenticodeSignature` (Valid + TimeStamperCertificate), and
+**re-anchors the exe `.sha256` sidecar to the SIGNED bytes**
+(sign-then-hash, the macOS arm's idiom). The provenance gate's PE arm
+mirrors the Mach-O arm: armed anchors the signed bytes + the
+signature; gate-off keeps the byte anchor.
 
 The **coordinator** (`publish.yml`, dispatch-only, `publish` default
 false) fans out to `_build-platform.yml` per platform and keeps ONE

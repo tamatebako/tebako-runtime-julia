@@ -42,8 +42,10 @@ the boot-contract parity `spec/` suite, and the hello-runtimes
 acceptance arm. linux-musl and windows arm64 have **no upstream
 binaries** (julialang.org publishes no musl julia ≥ 1.11 and no
 windows aarch64 — checked against `versions.json` 2026-11-23; a musl
-leg means a tamatebako source factory, not a repack row), and windows
-Authenticode signing is the spec 34 increment.
+leg means a tamatebako source factory, not a repack row). The windows
+leg carries the spec 34 Azure Trusted Signing lane
+(`ci/windows-sign-gate.sh`, gated on the `WINDOWS_SIGNING_ENABLED`
+repo variable; gate-off ships unsigned byte-identically).
 
 ## Why a tebako julia runtime (the honest framing)
 
@@ -116,9 +118,14 @@ sidecar to the SIGNED bytes (the sign step rewrites it — sign-then-hash),
 verifies the signature strict, and, when armed, asserts the team
 identity, the embedded entitlement pair, and the notarization ticket.
 The card keeps recording the fetch-verified release digest as
-consumption provenance. (windows Authenticode signing is the spec 34
-increment — the windows exe ships the release's bytes byte-identical,
-and the byte anchor holds there.)
+consumption provenance. The windows PE arm of the gate is the same
+shape under spec 34: with `WINDOWS_SIGNING_ENABLED` unset the exe
+ships the release's bytes byte-identical and the byte anchor holds
+(spec 00 invariant 7); armed, the exe is Azure Trusted Signed in-leg
+(the `windows-signing` environment, the RFC 3161 timestamp mandatory)
+and the gate anchors the exe `.sha256` sidecar to the SIGNED bytes
+(the verify step re-anchors it — sign-then-hash) plus a Valid
+timestamped Authenticode signature.
 
 ## The interpreter home: exec-cache visibility
 
@@ -408,10 +415,8 @@ runtime-packages` before editing or `git clean`-ing.
    binaries ≥ 1.11 (checked against `versions.json` 2026-11-23; musl
    entries exist only ≤ 1.10.x). A musl julia runtime means a
    tamatebako source factory compiling musl julia, not a repack row.
-4. windows Authenticode signing (spec 34 — Azure Artifact Signing, the
-   openjdk factory's `tools/windows-sign-gate.sh` arm).
-5. The julialang release monitor (upstream publishes `versions.json` —
+4. The julialang release monitor (upstream publishes `versions.json` —
    a poll-diff-pin workflow like the sibling factories').
-6. The boot-contract parity suite (`spec/`) against the ruby driver's
+5. The boot-contract parity suite (`spec/`) against the ruby driver's
    contract suite where the cases overlap.
-7. The hello-runtimes acceptance arm.
+6. The hello-runtimes acceptance arm.

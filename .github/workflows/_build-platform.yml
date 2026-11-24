@@ -54,7 +54,10 @@
 # Stage 3 (build): one leg per (julia x arch) of this platform:
 #   tools/build_runtime -> the macOS sign+notarize arm (spec 31, gated on
 #   APPLE_SIGNING_ENABLED — the sign step rewrites the exe .sha256
-#   sidecar to the SIGNED bytes, sign-then-hash) ->
+#   sidecar to the SIGNED bytes, sign-then-hash) -> the windows
+#   Authenticode arm (spec 34 §8.2, gated on WINDOWS_SIGNING_ENABLED —
+#   the verify step moves the signed bytes back over the contract path
+#   and re-anchors the exe .sha256 sidecar, sign-then-hash) ->
 #   ci/check_pair_provenance.sh -> tools/boot_smoke -> the
 #   runtime-packages-<os>-<arch>-<julia> artifact. The build fetches and
 #   sha256-verifies every input itself (the pinned julia prebuilt archive
@@ -318,6 +321,26 @@ jobs:
     # A hung leg fails loudly at the cap, never silently (the ruby
     # factory's 150-minute record is the reference).
     timeout-minutes: 150
+    # Spec 34 §3/§8.2 (the ruby factory's windows-signing lane, mirrored
+    # through tebako-runtime-python#107's): a job-level permissions block
+    # REPLACES the inherited set, so this is the complete grant —
+    # contents:read (the release-API digest fetches below) plus
+    # id-token:write, the OIDC boundary: the Entra federated credential
+    # issues Azure tokens only to a job of this repo running in the
+    # windows-signing environment. The signing steps below are gated on
+    # WINDOWS_SIGNING_ENABLED: unsigned runs carry the environment but
+    # never request a token. A reusable workflow can never ELEVATE past
+    # the caller's grant, so every caller (the three build-<platform>.yml
+    # triggers + publish.yml) declares the same superset.
+    permissions:
+      contents: read
+      id-token: write
+    # Spec 34's attestation boundary (see the id-token note above). The
+    # build job is shared by every platform's legs — only windows legs
+    # ever arm the signing chain, but ALL legs carry the environment:
+    # it must NEVER gain required reviewers (that would gate every
+    # platform's build on an approval); protection rules stay empty.
+    environment: windows-signing
     # build_runtime's release-digest fetches ride the GitHub API;
     # unauthenticated calls share the runner NAT's 60/h budget and die on
     # 403 flakes (the python factory's 02 round-4 macos leg).
@@ -446,6 +469,220 @@ jobs:
           runtime="tebako-runtime-${{ needs.compute.outputs.tebako_version }}-julia-${{ matrix.julia }}-${{ matrix.host_id }}"
           bash ci/macos-sign-notarize-runtime.sh "runtime-packages/$runtime"
 
+      # Spec 34 §8.2 — the Windows Authenticode leg (the ruby factory's
+      # lane, mirrored through tebako-runtime-python#107's): when the
+      # repo variable WINDOWS_SIGNING_ENABLED=true, the leg's ONE
+      # shippable PE — the launcher exe, shipped byte-identical from the
+      # pinned product release (the repack arm; julia.exe + its DLLs
+      # live INSIDE the .tfs env image — the exec-cache shape — so there
+      # is NO DLL facet, scripts/release_adapter.rb's dll_install_name
+      # default) — is Azure Trusted Signed here: after the build, before
+      # the provenance gate and the boot smoke (which then exercise the
+      # SIGNED bytes — the on-platform proof) and the upload. Signing
+      # rides a sign-staging COPY, never the contract path directly: the
+      # signing action enumerates by EXTENSION, so the exe stages under
+      # sign-staging/ (the .tfs, the card, and the sidecars never enter
+      # files-folder) and the verify step moves the signed bytes BACK
+      # over the contract path before signtool-verifying it there
+      # (signtool verifies content, not filename). Sign-then-hash (spec
+      # 34 §1.3): the build emitted the exe's .sha256 sidecar over the
+      # PRE-SIGN bytes, so the verify step re-anchors it to the SIGNED
+      # bytes (the macOS arm's idiom) — the provenance gate's sidecar
+      # arm and the publish stage then anchor exactly the shipped bytes.
+      # Gate off: every step below skips and the leg ships unsigned,
+      # byte-identically to today (spec 00 invariant 7 — §7.4 gate-off
+      # parity).
+      - name: Arm check — Windows signing (spec 34 §4)
+        if: matrix.os == 'windows'
+        id: signgate
+        shell: bash
+        env:
+          WINDOWS_SIGNING_ENABLED: ${{ vars.WINDOWS_SIGNING_ENABLED }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_ENDPOINT: ${{ vars.AZURE_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT_NAME: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
+          AZURE_SIGNING_CERT_PROFILE: ${{ vars.AZURE_SIGNING_CERT_PROFILE }}
+        run: bash ci/windows-sign-gate.sh
+
+      # The sign-staging copy (the §7.3 soundness shape): the action
+      # below enumerates by EXTENSION, so the exe stages under
+      # sign-staging/ with its own name — the filter covers it by
+      # construction. COPY, never move: the unsigned original keeps the
+      # contract path until the verify step replaces it with the signed
+      # bytes. A missing exe fails closed by name before any Azure
+      # round-trip.
+      - name: Stage the PE artifacts for signing (spec 34 §7.3)
+        if: steps.signgate.outputs.armed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime="tebako-runtime-${{ needs.compute.outputs.tebako_version }}-julia-${{ matrix.julia }}-${{ matrix.host_id }}"
+          exe="runtime-packages/$runtime.exe"
+          test -s "$exe" || { echo "::error::spec 34 §7.3: no runtime executable at $exe — nothing to sign"; exit 1; }
+          mkdir -p sign-staging
+          cp "$exe" "sign-staging/$runtime.exe"
+          ls -l sign-staging/
+
+      # OIDC workload-identity federation (spec 34 §3): no stored client
+      # secret anywhere; the federated credential is scoped to this repo
+      # × the windows-signing environment this job runs in.
+      - name: Azure login (OIDC, spec 34 §8.2)
+        if: steps.signgate.outputs.armed == 'true'
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2 (sha-pinned; proven on the ruby factory's armed windows legs + tebako dry-run 34490242097)
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # The action caches the TrustedSigning module at the CurrentUser
+      # path (Documents\PowerShell\Modules\TrustedSigning\0.5.8) while its
+      # own Install-Module lands AllUsers on the elevated runner — so a
+      # cache hit restores a 23 KiB stub and the action SKIPS the install,
+      # leaving Invoke-TrustedSigning unrecognized (the ruby factory's
+      # 2026-09-21 incident: v18's x64 legs; v17 was green only because
+      # its cache missed). Install to CurrentUser HERE, before the
+      # action's cache step: the post-job save then captures a real
+      # module, and even a poisoned restore can only overlay — never
+      # delete — these bytes.
+      - name: Preflight the TrustedSigning module (spec 34 §8.2)
+        if: steps.signgate.outputs.armed == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # PSGallery must be REGISTERED before Install-Module can name it:
+          # the ruby factory's v0.17.6 3.2.11/x86_64 leg (run 42691344155)
+          # died here with "Unable to find repository 'PSGallery'" — the
+          # runner image no longer guarantees the default registration.
+          # Register-PSRepository -Default restores it idempotently; a
+          # healthy registration is a no-op.
+          if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+            Register-PSRepository -Default
+          }
+          if (-not (Get-Module -ListAvailable TrustedSigning)) {
+            Install-Module -Name TrustedSigning -RequiredVersion 0.5.8 -Repository PSGallery -Scope CurrentUser -Force -AllowClobber
+          }
+          Import-Module TrustedSigning -Force
+          Get-Command Invoke-TrustedSigning | Out-Null
+          Write-Host "TrustedSigning module ready: $((Get-Module TrustedSigning).Version)"
+
+      # Signs the leg's PE artifact in the staging dir (the verify step
+      # below restores the contract path). The account input is
+      # `signing-account-name` — spec 34 §5's draft
+      # `trusted-signing-account-name` is the deprecated alias at this
+      # action's @v1 (the PR #566 deviation, verified against the action's
+      # action.yml); do not "upgrade" the action — @v2 dropped it.
+      - name: Sign the runtime exe (spec 34 §8.2)
+        if: steps.signgate.outputs.armed == 'true'
+        uses: Azure/artifact-signing-action@b443cf8ea4124818d2ea9f043cba29fc3ec47b16 # v1 (sha-pinned; proven on the ruby factory's armed windows legs + tebako dry-run 34490242097)
+        with:
+          endpoint: ${{ vars.AZURE_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_CERT_PROFILE }}
+          files-folder: sign-staging
+          # The enumeration gate (§7.3): everything PE signs by EXTENSION,
+          # never a name list — a new PE artifact must not ship unsigned by
+          # omission. Sound by construction here: the staging dir carries
+          # only the exe, so the filter can miss nothing the gate below
+          # would not also catch by name.
+          files-folder-filter: exe,dll
+          file-digest: SHA256
+          # §1.4: the RFC 3161 countersignature is mandatory (the action's
+          # default timestamp server; set explicitly per spec).
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: tebako julia runtime (tamatebako)
+
+      - name: Verify the signatures (spec 34 §7.1/§7.2)
+        if: steps.signgate.outputs.armed == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runtime = "tebako-runtime-${{ needs.compute.outputs.tebako_version }}-julia-${{ matrix.julia }}-${{ matrix.host_id }}"
+          # §7.3: enumerate the SIGNED set by EXTENSION at the staging
+          # dir, never a name list. This leg ships exactly ONE host-level
+          # PE — the launcher exe (julia.exe + its DLLs live INSIDE the
+          # .tfs env image — the exec-cache shape — so there is no DLL
+          # facet to enumerate; the gate is exe-nonempty, never
+          # dll-nonempty).
+          $exes = @(Get-ChildItem -Path 'sign-staging' -Filter '*.exe' -File)
+          if ($exes.Count -eq 0) {
+            Write-Host "::error::spec 34 §7.3: no .exe artifact under sign-staging — the runtime exe escaped signing"
+            exit 1
+          }
+          $stagedExe = "sign-staging/$runtime.exe"
+          if (-not (Test-Path $stagedExe -PathType Leaf)) {
+            Write-Host "::error::spec 34 §7.3: $stagedExe missing after the sign action — the runtime exe escaped signing"
+            exit 1
+          }
+          # Restore the CONTRACT-named path with the signed bytes,
+          # replacing the unsigned original the staging step left in
+          # place — the publish upload ships exactly this name, and the
+          # boot smoke + the provenance gate then exercise the signed
+          # bytes. The verify loop below runs at the restored path:
+          # signtool verifies content, not filename.
+          $exe = "runtime-packages/$runtime.exe"
+          Move-Item -Force $stagedExe $exe
+          $pes = @(Get-Item $exe)
+          # signtool.exe: the action's cached BuildTools first (the
+          # TrustedSigning module still owns that directory name at
+          # action @v1; the ArtifactSigning spelling is kept as a
+          # forward-compat fallback), then the runner image's Windows
+          # Kits; newest path first.
+          $signtool = @(
+            Get-ChildItem -Path "$env:LOCALAPPDATA\TrustedSigning\Microsoft.Windows.SDK.BuildTools" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue
+            Get-ChildItem -Path "$env:LOCALAPPDATA\ArtifactSigning\Microsoft.Windows.SDK.BuildTools" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue
+            Get-ChildItem -Path 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue
+          ) | Where-Object { $_.FullName -match '\\x64\\' } |
+              Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) {
+            Write-Host "::error::spec 34 §7.1: signtool.exe not found (action BuildTools cache and Windows Kits both empty)"
+            exit 1
+          }
+          Write-Host "signtool: $($signtool.FullName)"
+          $failed = $false
+          foreach ($pe in $pes) {
+            Write-Host "== signtool verify /pa /v $($pe.Name)"
+            $out = & $signtool.FullName verify /pa /v $pe.FullName 2>&1 | Out-String
+            Write-Host $out
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::spec 34 §7.1: signtool verify /pa FAILED for $($pe.Name)"
+              $failed = $true
+              continue
+            }
+            # §7.2/§1.4: the RFC 3161 countersignature is mandatory — an
+            # untimestamped signature fails the leg, never a warning.
+            if ($out -notmatch 'signature is timestamped' -and $out -notmatch 'RFC ?3161') {
+              Write-Host "::error::spec 34 §7.2: no RFC 3161 timestamp countersignature in signtool output for $($pe.Name)"
+              $failed = $true
+              continue
+            }
+            $sig = Get-AuthenticodeSignature $pe.FullName
+            if ($sig.Status -ne 'Valid') {
+              Write-Host "::error::spec 34 §7.1: Get-AuthenticodeSignature status '$($sig.Status)' (not Valid) for $($pe.Name)"
+              $failed = $true
+              continue
+            }
+            if ($null -eq $sig.TimeStamperCertificate) {
+              Write-Host "::error::spec 34 §7.2: Get-AuthenticodeSignature reports no TimeStamperCertificate for $($pe.Name)"
+              $failed = $true
+              continue
+            }
+            Write-Host "signed+timestamped: $($pe.Name) — $($sig.SignerCertificate.Subject)"
+          }
+          if ($failed) { exit 1 }
+          # Sign-then-hash (§1.3): the build emitted the exe's .sha256
+          # sidecar over the PRE-SIGN bytes, so re-anchor it to the
+          # SIGNED bytes — the provenance gate's sidecar arm and the
+          # publish stage anchor exactly the shipped bytes (the macOS
+          # arm's idiom; the store trust-anchor grammar is
+          # "<sha256>  <filename>\n").
+          $exeFull = (Resolve-Path $exe).Path
+          $signedSha = (Get-FileHash -Algorithm SHA256 $exeFull).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText("$exeFull.sha256", "$signedSha  $(Split-Path $exe -Leaf)`n")
+          Write-Host "sidecar re-anchored to the signed bytes: $signedSha  $(Split-Path $exe -Leaf)"
+
       # --- the gates (a red gate skips the publish below, and the
       # release job's audit then fails the run loudly) ------------------
       - name: Check the pair's provenance (container legs)
@@ -485,10 +722,15 @@ jobs:
             --tfs "$(echo .build/downloads/tfs/*/tfs-*)" --image "$stem.tfs"
 
       # Git-bash: the gate's tfs calls are native exes — the gate itself
-      # wraps them with MSYS2_ARG_CONV_EXCL + cygpath (its header).
+      # wraps them with MSYS2_ARG_CONV_EXCL + cygpath (its header). The
+      # PE arm keys off WINDOWS_SIGNING_ENABLED (the unsigned path stays
+      # first-class; armed, it anchors the SIGNED bytes + a Valid
+      # timestamped Authenticode signature — the Mach-O arm's mirror).
       - name: Check the pair's provenance (windows)
         if: matrix.os == 'windows'
         shell: bash
+        env:
+          WINDOWS_SIGNING_ENABLED: ${{ vars.WINDOWS_SIGNING_ENABLED }}
         run: |
           set -euo pipefail
           stem="runtime-packages/tebako-runtime-${{ needs.compute.outputs.tebako_version }}-julia-${{ matrix.julia }}-${{ matrix.host_id }}"
