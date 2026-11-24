@@ -64,7 +64,7 @@ container_version: "v1"
 #     "https://ghcr.io/v2/tamatebako/tpkg-builder-<triplet>/manifests/<tag>" | grep -i docker-content-digest
 container_digests:
   tpkg-builder-x86_64-linux-gnu:
-    amd64: "sha256:6ab7d71bcae6b93bcba4e5201835d7135ee99b29f72755d7f4bb8f48b398ae90"
+    amd64: "sha256:76d9822a4cdeb63d1b4081161c76a511ac50ecf40efd7c9820fe18c07225193d"
 
 # The published link-unit pin: the tamatebako/tebako release whose
 # prebuilt assets the legs CONSUME as downloads instead of building from
