@@ -304,13 +304,27 @@ jobs:
       # carries, so mirroring after a partial publish stays truthful (the
       # ruby factory's v0.16.27 lesson: a dogfood death skipped this step
       # and the registry silently lagged the release until hand-rendered).
+      - name: Resolve the registry version
+        id: resolve-version
+        run: |
+          if [ "${{ inputs.registry_only }}" = "true" ]; then
+            echo "TEBAKO_VERSION=${{ inputs.registry_version }}" >> "$GITHUB_ENV"
+          else
+            echo "TEBAKO_VERSION=${{ needs.linux-gnu.outputs.tebako_version || needs.macos.outputs.tebako_version || needs.windows.outputs.tebako_version }}" >> "$GITHUB_ENV"
+          fi
+          grep -q . "$GITHUB_ENV"
+      # The version resolution is shell-explicit (never the expression
+      # chain: GitHub's || binds tighter than &&, so
+      # `registry_only && registry_version || needs...` collapses to
+      # `false && (…)` on a publish run — the render env comes out empty
+      # and the registry never renders (run 45353796269's audit failure).
       - name: Render the registry entries
         if: ${{ always() && !cancelled() && !inputs.audit }}
         env:
-          TEBAKO_VERSION: ${{ inputs.registry_only && inputs.registry_version || (needs.linux-gnu.outputs.tebako_version || needs.macos.outputs.tebako_version || needs.windows.outputs.tebako_version) }}
+          TEBAKO_VERSION: ${{ env.TEBAKO_VERSION }}
         run: |
           if [ -z "$TEBAKO_VERSION" ]; then
-            echo "::error::registry_only needs registry_version (e.g. 0.1.0) — none given and no platform built one"
+            echo "::error::registry version resolution produced an empty value (registry_only=${{ inputs.registry_only }}, no platform output either)"
             exit 1
           fi
           ./tools/registry_update.rb
