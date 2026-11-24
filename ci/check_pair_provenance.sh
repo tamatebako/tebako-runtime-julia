@@ -34,14 +34,25 @@
 # fingerprints, per exe kind (magic-sniffed — Git-bash carries no
 # `file`):
 #
-#   1. byte anchor (ELF + PE): the exe's sha256 IS the pinned release's
+#   1. byte anchor (ELF): the exe's sha256 IS the pinned release's
 #      published launcher digest, recorded in the pair's own
 #      .contract.yaml (link_unit.launcher_sha256) — the consumed
 #      artifact flowed down unmodified. The exe's .sha256 sidecar must
-#      agree with both. (PE imports are not separately audited: the
-#      byte anchor plus the product's own ship gate cover the closure,
-#      and windows Authenticode signing is the spec 34 follow-up, never
-#      this gate's concern.)
+#      agree with both.
+#      PE (sign-then-hash): the exe may be Authenticode-signed IN-LEG
+#      after the build (the workflow's spec 34 §8.2 block —
+#      ci/windows-sign-gate.sh's arm), so the shipped bytes legitimately
+#      differ from the card's recorded release digest (that record stays
+#      as consumption provenance). The anchors here are: the exe .sha256
+#      sidecar agrees with the SIGNED bytes, and — when
+#      WINDOWS_SIGNING_ENABLED=true — Get-AuthenticodeSignature reports
+#      a Valid signature WITH a timestamp certificate; the unsigned
+#      (byte-identical) outcome is then a failure, because the armed
+#      sign step cannot silently no-op. Unsigned with
+#      WINDOWS_SIGNING_ENABLED unset stays first-class (spec 00
+#      invariant 7: byte-identical with the release's launcher, notice
+#      only). (PE imports are not separately audited: the byte anchor
+#      plus the product's own ship gate cover the closure.)
 #      Mach-O (sign-then-hash): the exe is signed IN-LEG after the build
 #      (ci/macos-sign-notarize-runtime.sh — spec 31 §5), so the shipped
 #      bytes legitimately differ from the card's recorded release digest
@@ -63,8 +74,9 @@
 #      (/bin/julia.exe on windows — tebako-runtime-openjdk's read-back
 #      arm, exe-suffixed).
 #
-# Env: APPLE_SIGNING_ENABLED / APPLE_TEAM_ID ride the Mach-O arm (the
-# workflow passes them; unset means the unsigned path's asserts only).
+# Env: APPLE_SIGNING_ENABLED / APPLE_TEAM_ID ride the Mach-O arm;
+# WINDOWS_SIGNING_ENABLED rides the PE arm (the workflow passes them;
+# unset means the unsigned path's asserts only).
 #
 # Usage:
 #   ci/check_pair_provenance.sh --exe PATH --card PATH --tfs PATH --image PATH
@@ -114,9 +126,15 @@ exe_kind() {
 
 KIND="$(exe_kind "$EXE")"
 ARMED="${APPLE_SIGNING_ENABLED:-false}"
+WIN_ARMED="${WINDOWS_SIGNING_ENABLED:-false}"
 ENTRYPOINT="/bin/julia"
 [ "$KIND" = "pe" ] && ENTRYPOINT="/bin/julia.exe"
 note "exe kind: $KIND (entrypoint $ENTRYPOINT)"
+
+# Path rules (windows leg): native exes (the tfs CLI below, powershell's
+# Get-AuthenticodeSignature in the PE arm) take the host path in native
+# form (cygpath; inert on POSIX).
+native_path() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s' "$1"; fi; }
 
 # --- 1. the byte anchor / the signed-bytes anchor ------------------------
 # YAML.dump renders the scalar as `launcher_sha256: <hex>` — sed-extract
@@ -130,7 +148,7 @@ case "$want" in
     got="$(sha256_of "$EXE")"
     sidecar="$(cat "$EXE.sha256" 2>/dev/null || true)"
     case "$KIND" in
-      elf | pe)
+      elf)
         if [ "$got" = "$want" ]; then
           note "the exe is byte-identical with the pinned release's published launcher ($want)"
         else
@@ -143,7 +161,50 @@ case "$want" in
           '') fail "$EXE.sha256 is missing — the store-shape trust anchor was not emitted" ;;
           *) fail "$EXE.sha256 disagrees with the exe bytes (sidecar: $sidecar; actual: $got)" ;;
         esac
-        [ "$KIND" = "pe" ] && note "PE import closure: covered by the byte anchor + the product's ship gate (windows Authenticode signing is the spec 34 follow-up)"
+        ;;
+      pe)
+        if [ "$got" = "$want" ]; then
+          # The unsigned path: the product's own bytes flowed down
+          # untouched (spec 00 invariant 7's first-class unsigned).
+          if [ "$WIN_ARMED" = "true" ]; then
+            fail "WINDOWS_SIGNING_ENABLED=true yet the exe is byte-identical with the UNSIGNED release launcher — the armed sign step cannot no-op (the workflow's spec 34 §8.2 block must run before this gate)"
+          else
+            note "the exe is byte-identical with the pinned release's published launcher (the unsigned path — spec 00 invariant 7)"
+          fi
+          case "$sidecar" in
+            "$got  $(basename "$EXE")") note "the exe .sha256 sidecar agrees with the bytes" ;;
+            '') fail "$EXE.sha256 is missing — the store-shape trust anchor was not emitted" ;;
+            *) fail "$EXE.sha256 disagrees with the exe bytes (sidecar: $sidecar; actual: $got)" ;;
+          esac
+          note "PE import closure: covered by the byte anchor + the product's ship gate"
+        else
+          # The signed path: sign-then-hash — the sidecar (re-anchored
+          # by the verify step) anchors the SIGNED bytes; the card's
+          # record stays as consumption provenance (the Mach-O arm's
+          # mirror).
+          [ "$WIN_ARMED" = "true" ] || fail "$EXE differs from the release's launcher digest yet WINDOWS_SIGNING_ENABLED is not true — an unexplained re-sign is a drifted consumption"
+          case "$sidecar" in
+            "$got  $(basename "$EXE")") note "the exe .sha256 sidecar agrees with the SIGNED bytes (sign-then-hash)" ;;
+            '') fail "$EXE.sha256 is missing — the sign step must re-anchor it to the signed bytes" ;;
+            *) fail "$EXE.sha256 anchors the PRE-SIGN bytes (sidecar: $sidecar; actual: $got) — sign-then-hash is mandatory" ;;
+          esac
+          if [ "$WIN_ARMED" = "true" ]; then
+            # The Authenticode arm (the Mach-O arm's codesign cascade,
+            # PE-shaped): armed means a VALID, timestamped signature on
+            # the shipped bytes — the workflow's pwsh verify step owns
+            # signtool /pa; here the identity anchor.
+            if command -v powershell.exe >/dev/null 2>&1; then
+              if MSYS2_ARG_CONV_EXCL='*' powershell.exe -NoProfile -Command \
+                "\$s = Get-AuthenticodeSignature -FilePath '$(native_path "$EXE")'; if (\$s.Status -eq 'Valid' -and \$null -ne \$s.TimeStamperCertificate) { exit 0 } else { exit 1 }"; then
+                note "Get-AuthenticodeSignature: Valid + timestamped (the armed spec 34 sign landed)"
+              else
+                fail "WINDOWS_SIGNING_ENABLED=true but Get-AuthenticodeSignature does not report a Valid, timestamped signature on $EXE"
+              fi
+            else
+              fail "WINDOWS_SIGNING_ENABLED=true on a host without powershell.exe — the Authenticode asserts cannot run"
+            fi
+          fi
+        fi
         ;;
       macho)
         if [ "$got" = "$want" ]; then
@@ -232,11 +293,10 @@ fi
 # that wrote the image re-reads it. The info surface runs the same tpkg
 # manifest model the resolvers parse — build-time parity, no YAML-parser
 # dependency. Path rules (windows leg): the native tfs takes the host
-# image path in native form (cygpath; inert on POSIX), while the VFS
+# image path in native form (native_path, hoisted above), while the VFS
 # paths must reach it verbatim — Git-bash/msys2 argument conversion
 # would otherwise rewrite them to host paths (MSYS2_ARG_CONV_EXCL, inert
 # on POSIX).
-native_path() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s' "$1"; fi; }
 IMAGE_NATIVE="$(native_path "$IMAGE")"
 MSYS2_ARG_CONV_EXCL='*' "$TFS" stat "$IMAGE_NATIVE" /__tpkg__/manifest.yaml >/dev/null || {
   fail "no /__tpkg__/manifest.yaml in $IMAGE"; }

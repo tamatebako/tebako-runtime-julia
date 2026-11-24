@@ -35,7 +35,14 @@ platform workflows (`build-linux-gnu.yml`, `build-macos.yml`,
 (`lint.yml`). The macOS legs run the spec 31 sign+notarize arm
 (`ci/macos-sign-notarize-runtime.sh`, gated on the
 `APPLE_SIGNING_ENABLED` repo variable; the sign step rewrites the exe
-`.sha256` sidecar to the SIGNED bytes — sign-then-hash). The publish
+`.sha256` sidecar to the SIGNED bytes — sign-then-hash). The windows
+leg runs the spec 34 §8.2 Azure Trusted Signing lane
+(`ci/windows-sign-gate.sh`'s arm check + the in-leg sign block, gated
+on the `WINDOWS_SIGNING_ENABLED` repo variable — gate-off ships
+unsigned byte-identically, spec 00 invariant 7): OIDC `azure/login` in
+the `windows-signing` environment, the RFC 3161 timestamp, `signtool
+verify /pa` at the contract path, then the exe `.sha256` sidecar is
+re-anchored to the SIGNED bytes (the macOS arm's idiom). The publish
 pipeline (`publish.yml` + the tebako-release gem via
 `scripts/release_adapter.rb` + `tools/registry_update.rb`) is present
 but **never fired — no release, no tag**: the first release is the
@@ -76,8 +83,12 @@ increments).
   product-repo change, never a factory-side one.
 - The windows leg has **no preload shim** (the link-unit tarball
   carries none): `LinkUnit#stage` is POSIX-only, and the windows env
-  image's layout card omits the `preload_shim` grant. windows signing
-  is the spec 34 follow-up, not this repo's current state.
+  image's layout card omits the `preload_shim` grant. The spec 34 sign
+  block's target is the launcher exe ONLY — julia.exe and its DLLs live
+  inside the env image (the exec-cache shape), so there is no DLL
+  facet; the provenance gate's PE arm mirrors the Mach-O arm (armed:
+  the SIGNED bytes + a Valid timestamped Authenticode signature;
+  gate-off: the byte anchor).
 - `gh pr create` bodies: always `--body-file` — inline `--body` with
   backticks executes them (ecosystem §13).
 - Architecture/chain questions: `docs/build-chain.md` first, then
