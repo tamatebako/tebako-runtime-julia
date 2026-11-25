@@ -90,6 +90,31 @@ byte-identical (the repack arm never re-signs upstream bytes; upstream
 julia ships hardened-runtime with its own JIT/injection grants, which
 govern the materialized interpreter process post-exec).
 
+The launcher's pair deliberately omits
+`allow-dyld-environment-variables`, and tebako#1117's audit verified
+that is correct for this shape (the julia cell). The stripping law is
+governed by the signature of the EXEC target: (a) the launcher IS
+driver-linked, so its boot-head self-insert fires on macOS — but under
+exec-cache the launcher only mounts, materializes, and re-execs the
+materialized `bin/julia`; nothing in its process consumes the
+interpose dylib, so a stripped insertion is the product's designed
+loud fallback, not a failure (the same product wrapper runs green on
+darwin-23 in the openjdk line with no entitlements at all). (b) The
+INTERPRETER's core IO reads the materialized host-real home
+(`Sys.BINDIR`-relative — exec-cache, never the shim), and the
+`preload_shim` grant's insertion into it survives macOS 14's stripping
+because UPSTREAM's own signature carries the grant: verified on the
+published v0.1.0 image — `bin/julia` is hardened-signed by Julia
+Computing LLC (A427R7F42H) carrying
+`com.apple.security.cs.allow-dyld-environment-variables` (plus
+allow-jit, allow-unsigned-executable-memory,
+disable-library-validation) — and the published pair boots green on
+darwin-23 (macOS 14.1.1 arm64): `julia-boot-ok 1.13.4` with the
+home-relative read served. The question reopens only if a future
+shape change makes a tebako-signed exe the insertion target (the
+python/php/R fs-TU re-exec shape), which this repack factory never
+builds.
+
 The **windows Authenticode arm** (spec 34 §8.2 —
 `ci/windows-sign-gate.sh` + the in-leg sign block) runs in-leg at the
 same point, between the build and the gates. The arm check gates on
